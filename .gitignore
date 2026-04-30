@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# PyInstaller intermediate + output (.exes are too big for git)
+build/
+dist/
+*.spec.bak
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Env / secrets
+.env
+.env.local
+
+# Runtime data — regenerated on first run
+watchdog.db
+watchdog.db-shm
+watchdog.db-wal
+*.sqlite3
+logs/
+uploads/
+training_data/
+ai_models/
+bots/
+backtest.log
+
+# Tests / debug scratch
+.pytest_cache/
+.coverage
+htmlcov/
+_test_*.py
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
