@@ -147,18 +147,35 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# ── CORS ─────────────────────────────────────────────────────────────────────
+#
+# This API binds to 127.0.0.1 only — it is reachable solely from processes
+# running on the same machine. CORS therefore can't be a defense against
+# attacker websites: those would have to first be opened by the user, AND
+# would then face a browser that refuses cross-origin localhost requests
+# anyway under modern same-origin rules. Auth is enforced separately via
+# Bearer JWTs (see app/auth.py).
+#
+# We accept any Origin so we don't have to keep chasing every legitimate
+# caller as it changes form:
+#   • Electron (packaged):  app://.        ─┐
+#   • Electron (file://):   file://         │ all three look different
+#   • Next.js dev server:   http://localhost:3000   to the browser, all
+#   • Tauri (future):       tauri://localhost       three need to talk
+#                                                   to this backend
+#
+# `allow_credentials=False` is intentional — we do NOT use cookies for
+# auth, only Authorization: Bearer headers. This combination (regex='.*'
+# + credentials=False) is permitted by the CORS spec; the alternative
+# (specific origin + credentials=True) was incorrectly excluding every
+# Electron build of the app.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:3001",
-        "http://localhost:3002",
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:3001",
-    ],
-    allow_credentials=True,
+    allow_origin_regex=".*",
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 app.include_router(whop.router)        # Whop auth — registered first so /api/auth/me works
