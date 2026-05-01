@@ -44,6 +44,19 @@ else:
         import requests.adapters
         _orig_send = requests.adapters.HTTPAdapter.send
 
+        # Auto-instrumented HTTP failures are surfaced as WARNING, not ERROR.
+        # Rationale:
+        #   • The auto-logger sees every transport hiccup the bot's HTTP
+        #     library does — connection resets, 4xx responses during retry/
+        #     auth flows, brief failures while the local backend restarts.
+        #     None of those are bugs in the bot's user code.
+        #   • If the failure IS a real bot bug (uncaught exception in the
+        #     bot's logic), it'll hit sys.excepthook below and be logged
+        #     as ERROR there. That's the channel that should drive the
+        #     "Fix with AI" badge — code-level errors only.
+        #   • The bot's own code can still emit ERROR by printing
+        #     "[ERROR] ..." or "Exception: ..." — those still get classified
+        #     ERROR by routers/bots.py heuristics.
         def _wd_requests_send(self, request, **kwargs):
             method = request.method
             url    = request.url
@@ -53,12 +66,12 @@ else:
                 response = _orig_send(self, request, **kwargs)
             except Exception as e:
                 ms = int((time.time() - t0) * 1000)
-                _emit(f"{_now()} | ERROR    | [HTTP ✗] {method} {url} — {type(e).__name__}: {e}  ({ms}ms)")
+                _emit(f"{_now()} | WARNING  | [HTTP x] {method} {url} - {type(e).__name__}: {e}  ({ms}ms)")
                 raise
             ms = int((time.time() - t0) * 1000)
             status = response.status_code
-            tag = "[HTTP ←]" if status < 400 else "[HTTP ✗]"
-            level = "INFO    " if status < 400 else "ERROR   "
+            tag    = "[HTTP <-]" if status < 400 else "[HTTP x]"
+            level  = "INFO    " if status < 400 else "WARNING "
             _emit(f"{_now()} | {level} | {tag} {status} {method} {url}  ({ms}ms)")
             return response
 
@@ -71,21 +84,22 @@ else:
         import httpx
         _orig_httpx_send = httpx.Client.send
 
+        # Same WARNING-not-ERROR rationale as the requests interceptor above.
         def _wd_httpx_send(self, request, *args, **kwargs):
             method = request.method
             url    = str(request.url)
-            _emit(f"{_now()} | INFO     | [HTTP →] {method} {url}")
+            _emit(f"{_now()} | INFO     | [HTTP ->] {method} {url}")
             t0 = time.time()
             try:
                 response = _orig_httpx_send(self, request, *args, **kwargs)
             except Exception as e:
                 ms = int((time.time() - t0) * 1000)
-                _emit(f"{_now()} | ERROR    | [HTTP ✗] {method} {url} — {type(e).__name__}: {e}  ({ms}ms)")
+                _emit(f"{_now()} | WARNING  | [HTTP x] {method} {url} - {type(e).__name__}: {e}  ({ms}ms)")
                 raise
             ms = int((time.time() - t0) * 1000)
             status = response.status_code
-            tag = "[HTTP ←]" if status < 400 else "[HTTP ✗]"
-            level = "INFO    " if status < 400 else "ERROR   "
+            tag    = "[HTTP <-]" if status < 400 else "[HTTP x]"
+            level  = "INFO    " if status < 400 else "WARNING "
             _emit(f"{_now()} | {level} | {tag} {status} {method} {url}  ({ms}ms)")
             return response
 
@@ -98,18 +112,18 @@ else:
             async def _wd_httpx_async_send(self, request, *args, **kwargs):
                 method = request.method
                 url    = str(request.url)
-                _emit(f"{_now()} | INFO     | [HTTP →] {method} {url}")
+                _emit(f"{_now()} | INFO     | [HTTP ->] {method} {url}")
                 t0 = time.time()
                 try:
                     response = await _orig_async_send(self, request, *args, **kwargs)
                 except Exception as e:
                     ms = int((time.time() - t0) * 1000)
-                    _emit(f"{_now()} | ERROR    | [HTTP ✗] {method} {url} — {type(e).__name__}: {e}  ({ms}ms)")
+                    _emit(f"{_now()} | WARNING  | [HTTP x] {method} {url} - {type(e).__name__}: {e}  ({ms}ms)")
                     raise
                 ms = int((time.time() - t0) * 1000)
                 status = response.status_code
-                tag = "[HTTP ←]" if status < 400 else "[HTTP ✗]"
-                level = "INFO    " if status < 400 else "ERROR   "
+                tag    = "[HTTP <-]" if status < 400 else "[HTTP x]"
+                level  = "INFO    " if status < 400 else "WARNING "
                 _emit(f"{_now()} | {level} | {tag} {status} {method} {url}  ({ms}ms)")
                 return response
 
