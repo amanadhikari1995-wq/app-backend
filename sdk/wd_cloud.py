@@ -70,6 +70,23 @@ LOCAL_API_PASS = os.getenv("LOCAL_API_PASS", "admin")
 CLOUD_EMAIL    = os.getenv("CLOUD_EMAIL",    "")
 CLOUD_PASSWORD = os.getenv("CLOUD_PASSWORD", "")
 
+# ── Session file (written by Electron main on user login) ───────────────────
+# Same path computed by run_backend.py and electron/session-store.js. Both
+# must agree, so this resolution is deliberately copy-pasted in three places
+# rather than hidden behind a common helper that's not available in a
+# PyInstaller-frozen exe.
+def _user_data_dir() -> "pathlib.Path":
+    import pathlib
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or str(pathlib.Path.home() / "AppData" / "Local")
+    elif sys.platform == "darwin":
+        base = str(pathlib.Path.home() / "Library" / "Application Support")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or str(pathlib.Path.home() / ".local" / "share")
+    return pathlib.Path(base) / "WatchDog"
+
+SESSION_FILE = _user_data_dir() / "session.json"
+
 # Derived WebSocket URL (https → wss, http → ws)
 CLOUD_WS_URL = CLOUD_API_URL.replace("https://", "wss://").replace("http://", "ws://") + "/ws"
 
@@ -84,8 +101,24 @@ _TOKEN_REFRESH_S   = 55 * 60  # refresh Supabase token every 55 min (expires at 
 # ──────────────────────────────────────────────────────────────────────────────
 class CloudAuth:
     """
-    Handles Supabase email/password login and token refresh.
-    Supabase config (URL + anon key) is auto-fetched from /api/config.
+    Handles the desktop's Supabase session. Three sources of credentials,
+    tried in this order:
+
+      1. session.json written by Electron main when the user signs in.
+         Holds {access_token, refresh_token, expires_at, user_id, email}.
+         This is the path every real install takes.
+
+      2. WATCHDOG_AUTH_TOKEN env var. Convenient for tests and CI — pass
+         a fresh token directly without going through the file.
+
+      3. CLOUD_EMAIL + CLOUD_PASSWORD env vars (legacy / dev). Same flow
+         this class always had; we keep it so devs running wd_cloud.py
+         standalone don't have to mock Electron.
+
+    Token refresh: when the access_token has < 5 minutes left, we use the
+    refresh_token to mint a new one via Supabase's REST API. The new
+    {access_token, refresh_token, expires_at} is written back to
+    session.json so the renderer (and a future restart) sees it.
     """
 
     def __init__(self) -> None:
@@ -94,7 +127,62 @@ class CloudAuth:
         self.access_token:  Optional[str]  = None
         self.refresh_token: Optional[str]  = None
         self._expires_at:   float          = 0.0
+        self._user_id:      Optional[str]  = None
+        self._email:        Optional[str]  = None
+        # Source of the current credentials — drives how we refresh:
+        #   "session_file" → write back to session.json after refresh
+        #   "env"          → don't write back (env-only test path)
+        #   "password"     → re-do email/password login
+        self._cred_source:  str            = "none"
         self._client = httpx.AsyncClient(timeout=15.0)
+
+    # ── session.json read/write ──────────────────────────────────────────────
+
+    def _load_session_file(self) -> bool:
+        """Returns True if session.json was found and loaded into self.*."""
+        try:
+            if not SESSION_FILE.exists():
+                return False
+            with SESSION_FILE.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            tok = data.get("access_token")
+            if not tok:
+                return False
+            self.access_token  = tok
+            self.refresh_token = data.get("refresh_token")
+            self._expires_at   = float(data.get("expires_at") or 0)
+            self._user_id      = data.get("user_id")
+            self._email        = data.get("email")
+            self._cred_source  = "session_file"
+            log.info("Loaded session for %s (uid=%s, expires in %ds)",
+                     self._email or "?",
+                     (self._user_id or "?")[:8],
+                     max(0, int(self._expires_at - time.time())))
+            return True
+        except Exception as e:
+            log.warning("Could not read %s: %s", SESSION_FILE, e)
+            return False
+
+    def _save_session_file(self) -> None:
+        """Persist refreshed tokens back so the renderer sees the same state."""
+        if self._cred_source != "session_file":
+            return  # only write back if that's where we read from
+        try:
+            SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "access_token":  self.access_token,
+                "refresh_token": self.refresh_token,
+                "expires_at":    int(self._expires_at),
+                "user_id":       self._user_id,
+                "email":         self._email,
+                "saved_at":      datetime.datetime.utcnow().isoformat() + "Z",
+            }
+            tmp = SESSION_FILE.with_suffix(".json.tmp")
+            with tmp.open("w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2)
+            tmp.replace(SESSION_FILE)
+        except Exception as e:
+            log.warning("Could not write %s: %s", SESSION_FILE, e)
 
     async def _fetch_supabase_config(self) -> None:
         """Auto-discover Supabase URL + anon key from the cloud server."""
@@ -123,56 +211,90 @@ class CloudAuth:
 
     async def login(self) -> str:
         """
-        Sign in with email + password. Returns the access token.
-        Also stores the refresh_token for later use.
+        Acquire an access_token using whichever credentials are available.
+        Tries (in order):
+          1. session.json (created by Electron main when user signs in)
+          2. WATCHDOG_AUTH_TOKEN env var (test/CI)
+          3. CLOUD_EMAIL + CLOUD_PASSWORD env vars (legacy / dev)
         """
+        # Path 1 — Electron-shared session file
+        if self._load_session_file():
+            # If the file's token is already expired, fall through to refresh()
+            if self._expires_at > time.time() + 60:
+                return self.access_token
+            # Token expired but we have a refresh_token → use it
+            if self.refresh_token:
+                try:
+                    return await self.refresh()
+                except Exception as e:
+                    log.warning("Session-file refresh failed (%s) — falling back", e)
+            # Fall through to other auth paths
+
+        # Path 2 — direct token via env (tests / CI)
+        env_token = os.getenv("WATCHDOG_AUTH_TOKEN", "").strip()
+        if env_token:
+            self.access_token  = env_token
+            self.refresh_token = os.getenv("WATCHDOG_REFRESH_TOKEN", "") or None
+            self._expires_at   = time.time() + 3600    # assume 1h, will refresh on demand
+            self._cred_source  = "env"
+            log.info("Using access token from WATCHDOG_AUTH_TOKEN env var.")
+            return self.access_token
+
+        # Path 3 — legacy email/password
         if not CLOUD_EMAIL or not CLOUD_PASSWORD:
             raise RuntimeError(
-                "CLOUD_EMAIL and CLOUD_PASSWORD must be set in your .env file."
+                "No credentials available.\n"
+                "  - Sign in via the desktop app (creates session.json automatically), OR\n"
+                "  - Set WATCHDOG_AUTH_TOKEN, OR\n"
+                "  - Set CLOUD_EMAIL + CLOUD_PASSWORD in your .env file."
             )
-        await self._fetch_supabase_config()
 
+        await self._fetch_supabase_config()
         url = f"{self._supabase_url}/auth/v1/token?grant_type=password"
-        headers = {
-            "apikey":       self._anon_key,
-            "Content-Type": "application/json",
-        }
-        body = {"email": CLOUD_EMAIL, "password": CLOUD_PASSWORD}
+        headers = {"apikey": self._anon_key, "Content-Type": "application/json"}
+        body    = {"email": CLOUD_EMAIL, "password": CLOUD_PASSWORD}
 
         log.info("Logging in to Supabase as %s …", CLOUD_EMAIL)
         r = await self._client.post(url, headers=headers, json=body)
-
         if r.status_code == 400:
-            raise RuntimeError(f"Login failed — bad credentials: {r.text}")
+            raise RuntimeError(f"Login failed - bad credentials: {r.text}")
         r.raise_for_status()
-
         data = r.json()
         self.access_token  = data["access_token"]
         self.refresh_token = data.get("refresh_token", "")
         self._expires_at   = time.time() + data.get("expires_in", 3600)
-        log.info("Supabase login successful — token valid for %d s", data.get("expires_in", 3600))
+        self._email        = CLOUD_EMAIL
+        self._cred_source  = "password"
+        log.info("Supabase login successful - token valid for %d s", data.get("expires_in", 3600))
         return self.access_token
 
     async def refresh(self) -> str:
-        """Use the refresh_token to get a new access token without re-entering password."""
+        """Use refresh_token (Supabase) to mint a new access_token. Writes
+        the result back to session.json if that's where we read from."""
         await self._fetch_supabase_config()
+        if not self.refresh_token:
+            raise RuntimeError("No refresh_token available to refresh with.")
 
         url = f"{self._supabase_url}/auth/v1/token?grant_type=refresh_token"
-        headers = {
-            "apikey":       self._anon_key,
-            "Content-Type": "application/json",
-        }
-        body = {"refresh_token": self.refresh_token}
+        headers = {"apikey": self._anon_key, "Content-Type": "application/json"}
+        body    = {"refresh_token": self.refresh_token}
 
-        log.info("Refreshing Supabase token …")
+        log.info("Refreshing Supabase token (source=%s) …", self._cred_source)
         r = await self._client.post(url, headers=headers, json=body)
         r.raise_for_status()
-
         data = r.json()
         self.access_token  = data["access_token"]
         self.refresh_token = data.get("refresh_token", self.refresh_token)
         self._expires_at   = time.time() + data.get("expires_in", 3600)
-        log.info("Token refreshed — expires in %d s", data.get("expires_in", 3600))
+
+        # Pick up user_id from the new token if we don't have it
+        if not self._user_id and "user" in data:
+            self._user_id = (data["user"] or {}).get("id")
+
+        # Persist back so the renderer + future restarts see the same state.
+        self._save_session_file()
+
+        log.info("Token refreshed - expires in %d s", data.get("expires_in", 3600))
         return self.access_token
 
     @property
@@ -184,7 +306,21 @@ class CloudAuth:
         return bool(self.access_token) and time.time() >= self._expires_at - 300
 
     async def ensure_valid_token(self) -> str:
-        """Return a valid access token, refreshing it if necessary."""
+        """Return a valid access token, refreshing it if necessary. If the
+        session file changed under us (user signed in / out from another
+        process), re-read it on the next call."""
+        # Hot-reload session.json when its mtime changes
+        if self._cred_source == "session_file" and SESSION_FILE.exists():
+            try:
+                disk_token = None
+                with SESSION_FILE.open("r", encoding="utf-8") as fh:
+                    disk_token = (json.load(fh) or {}).get("access_token")
+                if disk_token and disk_token != self.access_token:
+                    log.info("session.json updated externally — reloading")
+                    self._load_session_file()
+            except Exception:
+                pass
+
         if not self.access_token:
             return await self.login()
         if self.needs_refresh():
