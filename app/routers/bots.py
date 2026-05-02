@@ -1,7 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from typing import List, Optional
+import asyncio
 import subprocess
 import sys
 import os
@@ -17,8 +18,65 @@ from ..bot_manager import get_bot as _bot_fs  # ← per-bot filesystem isolation
 
 _SDK_DIR    = os.path.join(os.path.dirname(__file__), '..', '..', 'sdk')
 _ANSI_RE    = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-9;?]*[ -/]*[@-~])')
-from .. import models, schemas
-from ..auth import get_default_user as get_current_user
+from .. import models, schemas, cloud_client
+# Cloud-aware auth dep — for Supabase-authenticated callers, this also runs a
+# one-shot cloud→local sync the first time the user is seen by this process.
+# Falls back to get_default_user when no Bearer token is supplied, so legacy
+# sessions (Whop license, no Supabase login) keep working unchanged.
+from ..auth import get_current_user_cloud as get_current_user, _bearer_from_request
+
+
+# ── Cloud sync helpers ───────────────────────────────────────────────────────
+# Bots router CRUD writes to local SQLite as the source of truth, then fires a
+# fire-and-forget cloud mirror via FastAPI's BackgroundTasks. Failures are
+# logged but never block the response. The next authenticated request from
+# any device will re-sync the divergence.
+
+def _is_cloud_user(user) -> bool:
+    return bool(getattr(user, "supabase_uid", None)) and cloud_client.is_configured()
+
+def _bg_run(coro):
+    """BackgroundTasks expects a callable (not a coroutine). Wrap an async
+    coroutine into a sync callable that runs it in a fresh event loop."""
+    def _runner():
+        try:
+            asyncio.run(coro)
+        except Exception as e:
+            print(f"[cloud] background task failed: {e}")
+    return _runner
+
+async def _cloud_insert_and_stamp(token: str, supabase_uid: str, bot_id: int):
+    """Insert local bot into cloud, then write the returned cloud_id back.
+    Runs in a fresh DB session because BackgroundTasks executes after the
+    response is sent — the request session is already closed."""
+    db = SessionLocal()
+    try:
+        bot = db.query(models.Bot).filter(models.Bot.id == bot_id).first()
+        if not bot:
+            return
+        cloud_row = await cloud_client.insert_bot(token, supabase_uid, bot)
+        if cloud_row and cloud_row.get("id"):
+            bot.cloud_id = cloud_row["id"]
+            bot.cloud_synced_at = datetime.now(timezone.utc)
+            db.commit()
+    finally:
+        db.close()
+
+async def _cloud_update(token: str, cloud_id: str, bot_id: int):
+    db = SessionLocal()
+    try:
+        bot = db.query(models.Bot).filter(models.Bot.id == bot_id).first()
+        if not bot:
+            return
+        ok = await cloud_client.update_bot(token, cloud_id, bot)
+        if ok:
+            bot.cloud_synced_at = datetime.now(timezone.utc)
+            db.commit()
+    finally:
+        db.close()
+
+async def _cloud_delete(token: str, cloud_id: str):
+    await cloud_client.delete_bot(token, cloud_id)
 
 router = APIRouter(prefix="/api/bots", tags=["bots"])
 
@@ -478,7 +536,13 @@ def list_bots(db: Session = Depends(get_db), user=Depends(get_current_user)):
 
 
 @router.post("/", response_model=schemas.BotOut, status_code=201)
-def create_bot(data: schemas.BotCreate, db: Session = Depends(get_db), user=Depends(get_current_user)):
+def create_bot(
+    data: schemas.BotCreate,
+    request: Request,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
     bot = models.Bot(user_id=user.id, **data.model_dump())
     db.add(bot)
     db.commit()
@@ -494,6 +558,11 @@ def create_bot(data: schemas.BotCreate, db: Session = Depends(get_db), user=Depe
     _bot_td = os.path.join(_td_root, f"bot_{bot.id}_{_safe_name}")
     for _sub in ["ticks", "trades", "sessions", "documents", "ai_decisions", "logs"]:
         os.makedirs(os.path.join(_bot_td, _sub), exist_ok=True)
+    # ── Mirror to cloud (fire-and-forget) ─────────────────────────────────────
+    if _is_cloud_user(user):
+        token = _bearer_from_request(request)
+        if token:
+            background.add_task(_bg_run(_cloud_insert_and_stamp(token, user.supabase_uid, bot.id)))
     return bot
 
 
@@ -506,7 +575,14 @@ def get_bot(bot_id: int, db: Session = Depends(get_db), user=Depends(get_current
 
 
 @router.put("/{bot_id}", response_model=schemas.BotOut)
-def update_bot(bot_id: int, data: schemas.BotUpdate, db: Session = Depends(get_db), user=Depends(get_current_user)):
+def update_bot(
+    bot_id: int,
+    data: schemas.BotUpdate,
+    request: Request,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
     bot = db.query(models.Bot).filter(models.Bot.id == bot_id, models.Bot.user_id == user.id).first()
     if not bot:
         raise HTTPException(404, "Bot not found")
@@ -531,14 +607,31 @@ def update_bot(bot_id: int, data: schemas.BotUpdate, db: Session = Depends(get_d
             max_daily_loss          = fields.get("max_daily_loss"),
             auto_restart            = fields.get("auto_restart"),
         )
+    # ── Mirror to cloud ───────────────────────────────────────────────────────
+    if _is_cloud_user(user):
+        token = _bearer_from_request(request)
+        if token:
+            if bot.cloud_id:
+                background.add_task(_bg_run(_cloud_update(token, bot.cloud_id, bot.id)))
+            else:
+                # Local-only bot getting its first cloud sync (e.g. created
+                # offline on this machine before the user signed in).
+                background.add_task(_bg_run(_cloud_insert_and_stamp(token, user.supabase_uid, bot.id)))
     return bot
 
 
 @router.delete("/{bot_id}", status_code=204)
-def delete_bot(bot_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
+def delete_bot(
+    bot_id: int,
+    request: Request,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
     bot = db.query(models.Bot).filter(models.Bot.id == bot_id, models.Bot.user_id == user.id).first()
     if not bot:
         raise HTTPException(404, "Bot not found")
+    cloud_id_to_delete = bot.cloud_id   # capture before db.delete invalidates the row
     if bot_id in _processes:
         _processes[bot_id].terminate()
         _processes.pop(bot_id, None)
@@ -552,6 +645,11 @@ def delete_bot(bot_id: int, db: Session = Depends(get_db), user=Depends(get_curr
                 shutil.rmtree(_entry.path, ignore_errors=True)
     db.delete(bot)
     db.commit()
+    # ── Mirror delete to cloud (only if the row was previously synced) ───────
+    if _is_cloud_user(user) and cloud_id_to_delete:
+        token = _bearer_from_request(request)
+        if token:
+            background.add_task(_bg_run(_cloud_delete(token, cloud_id_to_delete)))
 
 
 @router.post("/{bot_id}/run")

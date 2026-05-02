@@ -85,18 +85,36 @@ def ensure_columns() -> None:
                                     (step 2 of the bot-data cloud-sync rollout)
     """
     with engine.connect() as conn:
+        # users.supabase_uid (step 2)
         try:
             conn.execute(text("ALTER TABLE users ADD COLUMN supabase_uid VARCHAR"))
             conn.commit()
         except Exception:
-            pass  # column already exists
-        # Partial unique index — supported by both SQLite (3.8+) and Postgres.
-        # `WHERE supabase_uid IS NOT NULL` lets the legacy singleton user
-        # (NULL supabase_uid) coexist with real Supabase-linked accounts.
+            pass
         try:
             conn.execute(text(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_supabase_uid_unique "
                 "ON users (supabase_uid) WHERE supabase_uid IS NOT NULL"
+            ))
+            conn.commit()
+        except Exception:
+            pass
+
+        # bots.cloud_id + bots.cloud_synced_at (step 3) — link the local row
+        # to its mirror in the Supabase `bots` table for cross-device sync.
+        try:
+            conn.execute(text("ALTER TABLE bots ADD COLUMN cloud_id VARCHAR"))
+            conn.commit()
+        except Exception:
+            pass
+        try:
+            conn.execute(text("ALTER TABLE bots ADD COLUMN cloud_synced_at DATETIME"))
+            conn.commit()
+        except Exception:
+            pass
+        try:
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_bots_cloud_id ON bots (cloud_id)"
             ))
             conn.commit()
         except Exception:

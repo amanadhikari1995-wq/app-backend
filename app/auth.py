@@ -293,6 +293,135 @@ async def get_current_user_supabase(
     return user
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CLOUD-SYNCED USER DEPENDENCY (step 3 — used by the bots router)
+# ─────────────────────────────────────────────────────────────────────────────
+# Same as get_current_user_supabase, but also performs a one-shot cloud→local
+# sync the FIRST time a given Supabase user authenticates against this Python
+# process. After the sync, the cloud_sync_migrations table marks the user
+# done; subsequent calls skip the sync (cheap dict lookup against a process-
+# local set).
+#
+# Falls back to get_default_user when no Bearer token is present, so legacy
+# desktop sessions (Whop license, no Supabase login) keep working unchanged.
+#
+# The cloud sync is INTENTIONALLY non-fatal: any cloud failure logs a warning
+# and returns the local user. The user can always work offline; we just don't
+# get cross-device sync until the next authenticated request.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Process-local set of Supabase UIDs we've already synced this run. Cleared on
+# restart, which is fine — has_migrated() in the cloud table is the long-term
+# truth.
+_synced_uids: set[str] = set()
+_synced_uids_lock = threading.Lock()
+
+
+async def _maybe_sync_user(db: Session, user: "models.User", token: str) -> None:
+    """One-time cloud→local pull for a freshly-recognized Supabase user.
+    Imports lazily to avoid pulling cloud_client into request paths that
+    don't need it (e.g. local-only Whop sessions)."""
+    uid = user.supabase_uid
+    if not uid:
+        return
+    with _synced_uids_lock:
+        if uid in _synced_uids:
+            return
+        _synced_uids.add(uid)
+
+    from . import cloud_client
+    try:
+        already = await cloud_client.has_migrated(token, uid)
+        cloud_bots = await cloud_client.list_cloud_bots(token) or []
+
+        # Pull cloud rows the local DB has never seen (no matching cloud_id).
+        new_locals = 0
+        for cb in cloud_bots:
+            cid = cb.get("id")
+            if not cid:
+                continue
+            exists = db.query(models.Bot).filter(models.Bot.cloud_id == cid).first()
+            if exists:
+                continue
+            db.add(models.Bot(
+                user_id        = user.id,
+                cloud_id       = cid,
+                cloud_synced_at= datetime.now(timezone.utc),
+                name           = cb.get("name") or "Untitled",
+                description    = cb.get("description"),
+                code           = cb.get("code") or "",
+                bot_type       = cb.get("bot_type"),
+                schedule_type  = cb.get("schedule_type") or "always",
+                schedule_start = cb.get("schedule_start"),
+                schedule_end   = cb.get("schedule_end"),
+                max_amount_per_trade    = cb.get("max_amount_per_trade"),
+                max_contracts_per_trade = cb.get("max_contracts_per_trade"),
+                max_daily_loss          = cb.get("max_daily_loss"),
+                auto_restart   = bool(cb.get("auto_restart") or False),
+            ))
+            new_locals += 1
+
+        # First-time push: any local bots NOT yet synced get pushed up.
+        if not already:
+            local_unsynced = (db.query(models.Bot)
+                              .filter(models.Bot.user_id == user.id,
+                                      models.Bot.cloud_id.is_(None))
+                              .all())
+            if local_unsynced:
+                inserted = await cloud_client.upsert_bots_batch(token, uid, local_unsynced)
+                # Match returned cloud rows back to local rows by name (the only
+                # field guaranteed to be unique-per-user in practice).
+                by_name = {row.get("name"): row.get("id") for row in inserted if row.get("id")}
+                for b in local_unsynced:
+                    cid = by_name.get(b.name)
+                    if cid:
+                        b.cloud_id = cid
+                        b.cloud_synced_at = datetime.now(timezone.utc)
+            await cloud_client.mark_migration_done(token, uid, len(local_unsynced))
+
+        db.commit()
+        if new_locals:
+            print(f"[auth] cloud-sync: pulled {new_locals} bot(s) from cloud for user {uid[:8]}")
+    except Exception as e:
+        # Never let a sync failure break authentication. Roll back the partial
+        # state so the next request retries cleanly.
+        db.rollback()
+        with _synced_uids_lock:
+            _synced_uids.discard(uid)
+        print(f"[auth] cloud-sync skipped (will retry next request): {e}")
+
+
+async def get_current_user_cloud(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> "models.User":
+    """Cloud-aware auth dep. If a Bearer token is present, validates it via
+    Supabase, auto-provisions the local user, and runs a one-shot cloud sync.
+    Falls back to the default user when no token is supplied."""
+    token = _bearer_from_request(request)
+    if not token:
+        # Legacy / Whop-license / no-Supabase-login path.
+        return get_default_user(db=db)
+
+    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+        # Cloud not configured on this build — degrade silently to default user
+        # so we don't 503 every request just because env wasn't set.
+        return get_default_user(db=db)
+
+    sb_user = await _validate_with_supabase(token)
+    if not sb_user:
+        # Token invalid — don't fall through to default user (that would let
+        # an attacker with no auth see the singleton's data).
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token")
+
+    user = _provision_user_from_supabase(db, sb_user)
+    if not user.is_active:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Account is inactive")
+
+    await _maybe_sync_user(db, user, token)
+    return user
+
+
 # ── Default user (keeps all existing routes working unchanged) ────────────────
 
 def ensure_default_user():
