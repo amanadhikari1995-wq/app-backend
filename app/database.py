@@ -121,6 +121,40 @@ def ensure_columns() -> None:
             pass
 
 
+def ensure_bot_folders() -> None:
+    """
+    Make sure every bot in the DB has its on-disk folder. Bots that pre-date
+    bot_manager (or whose folders were deleted out from under them) get their
+    folders rebuilt from the DB row. Idempotent — silently skips bots whose
+    folder already exists.
+
+    Called at startup AFTER ensure_columns + ensure_indexes so the schema is
+    settled before we touch any rows.
+    """
+    from .bot_manager import BotFS
+    from . import models
+    db = SessionLocal()
+    rebuilt = 0
+    try:
+        for bot in db.query(models.Bot).all():
+            try:
+                bfs = BotFS(bot.id, bot.name or f"bot-{bot.id}")
+                if bfs.exists():
+                    continue
+                bfs.create(
+                    code        = bot.code or "",
+                    description = bot.description or "",
+                )
+                rebuilt += 1
+            except Exception as e:
+                # One bot's folder failure must not abort the rest.
+                print(f"[ensure_bot_folders] bot id={bot.id} failed: {e}")
+        if rebuilt:
+            print(f"[ensure_bot_folders] rebuilt {rebuilt} missing bot folder(s)")
+    finally:
+        db.close()
+
+
 def ensure_indexes() -> None:
     """
     Create performance-critical indexes that aren't on the ORM models.
