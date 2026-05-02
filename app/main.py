@@ -106,6 +106,17 @@ async def lifespan(app: FastAPI):
     ensure_indexes()
     ensure_default_user()
     ensure_bot_folders()
+
+    # ── Bidirectional cloud sync ────────────────────────────────────────
+    # Background thread that polls Supabase every SYNC_INTERVAL_S and
+    # reconciles local SQLite with the cloud bots table. Decouples sync
+    # from request handling so it works regardless of which auth path the
+    # renderer uses, never silently fails, and keeps trying after errors.
+    try:
+        from . import sync_engine
+        sync_engine.start()
+    except Exception as e:
+        log.warning("sync engine failed to start: %s", e)
     # Reset any bots stuck in RUNNING from a previous server process — their
     # subprocesses are gone after a restart so the status must be corrected.
     try:
@@ -205,6 +216,18 @@ app.include_router(sessions.router)    # global session manager REST surface
 @app.get("/")
 def root():
     return {"status": "WATCH-DOG Universal Bot Platform running", "version": "3.3.0"}
+
+
+@app.get("/api/sync/status")
+def sync_status():
+    """Live state of the cloud-sync engine. Used by the desktop UI to show
+    a 'syncing / paused / error' indicator and surface the reason when sync
+    isn't running (e.g. session.json missing, JWT expired)."""
+    try:
+        from . import sync_engine
+        return sync_engine.get_status()
+    except Exception as e:
+        return {"state": "error", "last_error": f"sync_engine import failed: {e}"}
 
 
 @app.get("/health")

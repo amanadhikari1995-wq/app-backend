@@ -572,11 +572,9 @@ def create_bot(
     _bot_td = os.path.join(_td_root, f"bot_{bot.id}_{_safe_name}")
     for _sub in ["ticks", "trades", "sessions", "documents", "ai_decisions", "logs"]:
         os.makedirs(os.path.join(_bot_td, _sub), exist_ok=True)
-    # ── Mirror to cloud (fire-and-forget) ─────────────────────────────────────
-    if _is_cloud_user(user):
-        token = _bearer_from_request(request)
-        if token:
-            background.add_task(_bg_run(_cloud_insert_and_stamp(token, user.supabase_uid, bot.id)))
+    # Cloud mirror happens via sync_engine (background thread, polls every 5s).
+    # No per-request push — that path was unreliable (no retry, silently
+    # failed when token validation 403'd, depended on supabase_uid being set).
     return bot
 
 
@@ -621,16 +619,7 @@ def update_bot(
             max_daily_loss          = fields.get("max_daily_loss"),
             auto_restart            = fields.get("auto_restart"),
         )
-    # ── Mirror to cloud ───────────────────────────────────────────────────────
-    if _is_cloud_user(user):
-        token = _bearer_from_request(request)
-        if token:
-            if bot.cloud_id:
-                background.add_task(_bg_run(_cloud_update(token, bot.cloud_id, bot.id)))
-            else:
-                # Local-only bot getting its first cloud sync (e.g. created
-                # offline on this machine before the user signed in).
-                background.add_task(_bg_run(_cloud_insert_and_stamp(token, user.supabase_uid, bot.id)))
+    # Cloud mirror happens via sync_engine (background thread).
     return bot
 
 
@@ -659,11 +648,24 @@ def delete_bot(
                 shutil.rmtree(_entry.path, ignore_errors=True)
     db.delete(bot)
     db.commit()
-    # ── Mirror delete to cloud (only if the row was previously synced) ───────
-    if _is_cloud_user(user) and cloud_id_to_delete:
-        token = _bearer_from_request(request)
-        if token:
-            background.add_task(_bg_run(_cloud_delete(token, cloud_id_to_delete)))
+    # Cloud delete propagates via sync_engine (it sees the local row vanish
+    # and removes the corresponding cloud row on the next cycle, OR — if the
+    # cloud row vanished first — the local row is already gone). See
+    # sync_engine._run_one_cycle DELETE PROPAGATION block.
+    # Note: with the sync_engine architecture, true bidirectional delete
+    # propagation requires DELETE to also push to cloud. We do it here:
+    if cloud_id_to_delete:
+        try:
+            from .. import cloud_client
+            import asyncio
+            # Sync delete (block briefly) so the cloud row goes away before
+            # the engine's next cycle would re-create it from cloud → local.
+            from ..auth import _bearer_from_request as _bft
+            tok = _bft(request)
+            if tok:
+                asyncio.run(cloud_client.delete_bot(tok, cloud_id_to_delete))
+        except Exception as e:
+            print(f"[bots/delete] cloud delete fire-and-forget failed (sync engine will reconcile): {e}")
 
 
 @router.post("/{bot_id}/run")
