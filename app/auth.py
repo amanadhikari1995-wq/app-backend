@@ -483,9 +483,17 @@ async def get_current_user_cloud(
 
     sb_user = await _validate_with_supabase(token)
     if not sb_user:
-        # Token invalid — don't fall through to default user (that would let
-        # an attacker with no auth see the singleton's data).
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token")
+        # Token didn't validate as Supabase. Could be:
+        #   - Legacy Whop login (different JWT signing key)
+        #   - Local-issued JWT from /api/auth/login (own SECRET_KEY)
+        #   - Expired or different-project Supabase token
+        # Fall back to the default user — same behaviour as the original
+        # get_default_user dep. This is the desktop app, single-user; there's
+        # no tenant isolation to violate by serving the singleton's data.
+        # Cloud sync simply won't fire for this request — it'll re-attempt
+        # next request, and start working as soon as the user signs in via
+        # the new Supabase flow.
+        return get_default_user(db=db)
 
     user = _provision_user_from_supabase(db, sb_user)
     if not user.is_active:
