@@ -29,6 +29,13 @@ class User(Base):
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+    # Supabase user UUID — populated on first authenticated request via the
+    # cloud-sync flow (auth.get_current_user_supabase). NULL for the legacy
+    # singleton "watchdog" user (id=1) and any local-only account that never
+    # signed in via Supabase. Indexed + unique-when-present (the partial
+    # unique index lives in database.ensure_columns()).
+    supabase_uid = Column(String, index=True, nullable=True)
+
     bots = relationship("Bot", back_populates="user", cascade="all, delete-orphan")
     bot_logs = relationship("BotLog", back_populates="user", cascade="all, delete-orphan")
     trades = relationship("Trade", back_populates="user", cascade="all, delete-orphan")

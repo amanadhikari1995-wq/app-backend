@@ -97,7 +97,10 @@ async def lifespan(app: FastAPI):
     # ORM models (bot_logs, trades). Without these, queries that fetch
     # "recent logs for bot N" do a full table scan that gets pathological
     # after hours of bot activity.
-    from .database import ensure_indexes
+    from .database import ensure_columns, ensure_indexes
+    # Order matters: ensure_columns first (adds users.supabase_uid for the
+    # cloud-sync auth flow), then ensure_indexes (touches bot_logs/trades).
+    ensure_columns()
     ensure_indexes()
     ensure_default_user()
     # Reset any bots stuck in RUNNING from a previous server process — their

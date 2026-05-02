@@ -73,6 +73,36 @@ def get_db():
         db.close()
 
 
+def ensure_columns() -> None:
+    """
+    Add columns that may be missing on legacy SQLite databases. Idempotent —
+    each statement is wrapped in try/except so re-running on a current DB is
+    a no-op. Called once at app startup from main.py BEFORE ensure_indexes.
+
+    Currently adds:
+      • users.supabase_uid       — Supabase user UUID, populated on first
+                                    authenticated request via cloud-sync auth
+                                    (step 2 of the bot-data cloud-sync rollout)
+    """
+    with engine.connect() as conn:
+        try:
+            conn.execute(text("ALTER TABLE users ADD COLUMN supabase_uid VARCHAR"))
+            conn.commit()
+        except Exception:
+            pass  # column already exists
+        # Partial unique index — supported by both SQLite (3.8+) and Postgres.
+        # `WHERE supabase_uid IS NOT NULL` lets the legacy singleton user
+        # (NULL supabase_uid) coexist with real Supabase-linked accounts.
+        try:
+            conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_supabase_uid_unique "
+                "ON users (supabase_uid) WHERE supabase_uid IS NOT NULL"
+            ))
+            conn.commit()
+        except Exception:
+            pass
+
+
 def ensure_indexes() -> None:
     """
     Create performance-critical indexes that aren't on the ORM models.

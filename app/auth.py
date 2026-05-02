@@ -8,10 +8,13 @@ Handles:
 """
 
 import os
+import time
+import threading
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Tuple
 
-from fastapi import Depends, HTTPException, status
+import httpx
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -109,6 +112,184 @@ def get_current_user_jwt(
 
     if user is None or not user.is_active:
         raise credentials_exception
+    return user
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SUPABASE AUTH (step 2 of the cloud-sync rollout)
+# ─────────────────────────────────────────────────────────────────────────────
+# A new dependency `get_current_user_supabase` that validates a Supabase JWT
+# by calling Supabase's `/auth/v1/user` endpoint and auto-provisions a local
+# `User` row keyed by `supabase_uid` if missing.
+#
+# DESIGN NOTES
+#   1. We do NOT verify the JWT signature locally — that would require
+#      shipping `SUPABASE_JWT_SECRET` to every desktop install, which would
+#      let any user decode/forge any other user's tokens. Calling the
+#      Supabase REST endpoint with the bearer token validates the signature
+#      AND returns the canonical user record in one round-trip.
+#   2. Validation results cache for ~60s per token (in-process LRU). After
+#      the first call, validation costs a dict lookup. Cache survives until
+#      the token expires or gets evicted.
+#   3. If env vars (SUPABASE_URL + SUPABASE_ANON_KEY) aren't set we degrade
+#      gracefully to "no Supabase auth available" — routers that depend on
+#      this function will return 503 with a clear message instead of a
+#      misleading 401.
+#   4. NO EXISTING ROUTER USES THIS YET. Step 2 is purely additive: this
+#      function is exported and ready, but `get_current_user` (the alias
+#      every router actually imports) still resolves to `get_default_user`.
+#      Per-router migration starts in step 5.
+# ─────────────────────────────────────────────────────────────────────────────
+
+SUPABASE_URL      = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
+_SUPABASE_CACHE_TTL = 60          # seconds
+_SUPABASE_CACHE_MAX = 256         # LRU cap — most users have ≤2 active tokens
+
+# token → (expires_at_epoch, supabase_user_dict)
+_supabase_cache: dict[str, Tuple[float, dict]] = {}
+_supabase_cache_lock = threading.Lock()
+
+
+def _cache_get(token: str) -> Optional[dict]:
+    now = time.time()
+    with _supabase_cache_lock:
+        entry = _supabase_cache.get(token)
+        if not entry:
+            return None
+        exp, data = entry
+        if exp < now:
+            _supabase_cache.pop(token, None)
+            return None
+        return data
+
+
+def _cache_put(token: str, data: dict) -> None:
+    with _supabase_cache_lock:
+        # Trivial LRU eviction — drop the oldest if we exceed the cap.
+        if len(_supabase_cache) >= _SUPABASE_CACHE_MAX:
+            oldest = min(_supabase_cache.items(), key=lambda kv: kv[1][0])[0]
+            _supabase_cache.pop(oldest, None)
+        _supabase_cache[token] = (time.time() + _SUPABASE_CACHE_TTL, data)
+
+
+def _bearer_from_request(request: Request) -> Optional[str]:
+    auth = request.headers.get("authorization") or request.headers.get("Authorization")
+    if not auth:
+        return None
+    parts = auth.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return None
+    return parts[1].strip() or None
+
+
+async def _validate_with_supabase(token: str) -> Optional[dict]:
+    """Returns the Supabase user dict (with `id`, `email`, `user_metadata`)
+    or None if the token is invalid / expired / Supabase is unreachable."""
+    cached = _cache_get(token)
+    if cached is not None:
+        return cached
+    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+        return None
+    url = f"{SUPABASE_URL}/auth/v1/user"
+    headers = {
+        "apikey":        SUPABASE_ANON_KEY,
+        "authorization": f"Bearer {token}",
+        "accept":        "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get(url, headers=headers)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if not isinstance(data, dict) or not data.get("id"):
+            return None
+        _cache_put(token, data)
+        return data
+    except (httpx.HTTPError, ValueError) as e:
+        # Network glitch or bad JSON — refuse to validate. Caller returns 401.
+        # Don't cache failures; the token might be valid on the next request.
+        print(f"[auth] supabase validation failed: {e}")
+        return None
+
+
+def _provision_user_from_supabase(db: Session, sb_user: dict) -> models.User:
+    """Find or create a local `User` row matching this Supabase identity.
+    Two lookup paths:
+      1. supabase_uid match — the canonical case after first provision.
+      2. email match — for users whose local row predates this column;
+         we adopt the row by stamping its supabase_uid + commit."""
+    uid   = sb_user["id"]
+    email = (sb_user.get("email") or "").lower().strip()
+    meta  = sb_user.get("user_metadata") or {}
+    display_name = (
+        meta.get("full_name") or meta.get("display_name") or meta.get("name")
+        or (email.split("@")[0] if email else f"user-{uid[:8]}")
+    )
+
+    user = db.query(models.User).filter(models.User.supabase_uid == uid).first()
+    if user:
+        return user
+
+    if email:
+        user = db.query(models.User).filter(models.User.email == email).first()
+        if user:
+            user.supabase_uid = uid
+            db.commit()
+            db.refresh(user)
+            return user
+
+    # Brand-new user — create the row. username MUST be unique; we add a
+    # short uid suffix if there's already a row with the same username.
+    base_username = display_name[:32] or f"user-{uid[:8]}"
+    username = base_username
+    suffix = 1
+    while db.query(models.User).filter(models.User.username == username).first():
+        username = f"{base_username}-{uid[:6]}{'' if suffix == 1 else suffix}"
+        suffix += 1
+        if suffix > 5:
+            username = f"user-{uid[:12]}"
+            break
+
+    user = models.User(
+        username=username,
+        email=email or f"{uid}@cloud-sync.local",
+        hashed_password="",          # Supabase owns the password
+        is_active=True,
+        supabase_uid=uid,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+async def get_current_user_supabase(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> models.User:
+    """FastAPI dependency. Returns the local `User` whose `supabase_uid`
+    matches the Bearer token's owner. Auto-provisions on first call.
+    Raises 401 if the token is missing/invalid; 503 if Supabase auth is
+    not configured on this instance."""
+    token = _bearer_from_request(request)
+    if not token:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Bearer token required")
+
+    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Supabase auth not configured on this server (set SUPABASE_URL + SUPABASE_ANON_KEY)",
+        )
+
+    sb_user = await _validate_with_supabase(token)
+    if not sb_user:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token")
+
+    user = _provision_user_from_supabase(db, sb_user)
+    if not user.is_active:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Account is inactive")
     return user
 
 
