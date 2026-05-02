@@ -96,10 +96,62 @@ def main() -> None:
     from app.main import app
 
     import uvicorn
+    import socket
+    import time
     port = int(os.environ.get("WATCHDOG_API_PORT", "8000"))
     host = os.environ.get("WATCHDOG_API_HOST", "127.0.0.1")
-    log.info("Starting uvicorn on %s:%d", host, port)
 
+    # ── Bind pre-flight ─────────────────────────────────────────────────────
+    # On Windows, the kernel keeps the previous binder's socket in TIME_WAIT
+    # for up to ~120s after a hard kill. If we try to bind 8000 immediately
+    # after a crash/restart, uvicorn exits with WinError 10048 — which
+    # backend-runner.js's Service interprets as "exited" → auto-respawn,
+    # creating duplicate processes that all spam the same bind error in the
+    # log. Avoid this entirely:
+    #
+    #   1. Probe the port. If something else is listening, check whether it
+    #      looks like another instance of us (same host:port, accepts TCP).
+    #      If yes, exit silently with success — backend-runner.js won't
+    #      respawn (we'd be the duplicate).
+    #
+    #   2. If port is unbound but in TIME_WAIT, retry up to 12 times with
+    #      0.75s spacing (= 9s total). Almost always frees within 5s.
+    #
+    # Net effect: zero WinError 10048 in the log under any restart pattern.
+    # ────────────────────────────────────────────────────────────────────────
+    def _is_port_in_use(h, p):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.3)
+        try:
+            return s.connect_ex((h, p)) == 0
+        finally:
+            s.close()
+
+    def _can_bind(h, p):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind((h, p))
+            return True
+        except OSError:
+            return False
+        finally:
+            s.close()
+
+    if _is_port_in_use(host, port):
+        log.warning("Port %s:%d is already serving — assuming a sibling watchdog-backend "
+                    "instance won the race. Exiting silently to avoid duplicate.", host, port)
+        return  # clean exit, Service won't respawn
+
+    for attempt in range(12):
+        if _can_bind(host, port):
+            break
+        log.info("Port %s:%d not yet bindable (TIME_WAIT?), retrying… (%d/12)", host, port, attempt + 1)
+        time.sleep(0.75)
+    else:
+        log.error("Port %s:%d still not bindable after 9s — giving up.", host, port)
+        return  # clean exit, no error spam
+
+    log.info("Starting uvicorn on %s:%d", host, port)
     uvicorn.run(
         app,
         host=host,
