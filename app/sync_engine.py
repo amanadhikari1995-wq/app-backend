@@ -122,10 +122,9 @@ def _read_session() -> Optional[dict]:
         return None
 
 
-def _is_jwt_expired(jwt: str) -> bool:
+def _is_jwt_expired(jwt: str, safety_margin_s: int = 30) -> bool:
     """Cheap exp check — decodes JWT payload without verifying signature.
-    We don't need verification here because the cloud will reject expired
-    tokens with 401 anyway; this just lets us skip pointless network calls."""
+    Returns True if exp < (now + safety_margin)."""
     try:
         import base64
         parts = jwt.split(".")
@@ -136,9 +135,53 @@ def _is_jwt_expired(jwt: str) -> bool:
         exp = payload.get("exp")
         if not exp:
             return False
-        return int(exp) < int(time.time()) + 30  # 30s safety margin
+        return int(exp) < int(time.time()) + safety_margin_s
     except Exception:
         return True
+
+
+def _refresh_session(refresh_token: str) -> Optional[dict]:
+    """Trade a refresh_token for a fresh access_token via Supabase.
+    Returns the new session dict or None on failure."""
+    if not refresh_token or not SUPABASE_URL or not SUPABASE_ANON_KEY:
+        return None
+    url = f"{SUPABASE_URL}/auth/v1/token?grant_type=refresh_token"
+    headers = {
+        "apikey":       SUPABASE_ANON_KEY,
+        "content-type": "application/json",
+        "accept":       "application/json",
+    }
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT_S) as c:
+            r = c.post(url, headers=headers, json={"refresh_token": refresh_token})
+        if r.status_code != 200:
+            log.warning("token refresh %d: %s", r.status_code, r.text[:200])
+            return None
+        data = r.json()
+        return {
+            "access_token":  data.get("access_token"),
+            "refresh_token": data.get("refresh_token"),
+            "expires_at":    int(time.time()) + int(data.get("expires_in", 3600)),
+            "user_id":       data.get("user", {}).get("id"),
+            "email":         data.get("user", {}).get("email"),
+        }
+    except httpx.HTTPError as e:
+        log.warning("token refresh network error: %s", e)
+        return None
+
+
+def _write_session(session: dict) -> bool:
+    """Atomically write session.json. Used after a successful refresh."""
+    try:
+        path = _user_data_dir() / "session.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(session, indent=2), encoding="utf-8")
+        tmp.replace(path)
+        return True
+    except Exception as e:
+        log.warning("session.json write failed: %s", e)
+        return False
 
 
 # ── Cloud HTTP helpers ──────────────────────────────────────────────────────
@@ -252,43 +295,72 @@ def _build_local_from_cloud(user_id: int, cb: dict) -> models.Bot:
 
 
 def _local_user_for_supabase(db: Session, supabase_uid: str, email: Optional[str]) -> models.User:
-    """Find or auto-provision the local users row for this Supabase identity.
-    Mirrors the logic in auth.py._provision_user_from_supabase but without
-    requiring a Bearer token in a request — we run from background context."""
-    user = db.query(models.User).filter(models.User.supabase_uid == supabase_uid).first()
-    if user:
-        return user
-    if email:
-        user = db.query(models.User).filter(models.User.email == email).first()
-        if user:
-            user.supabase_uid = supabase_uid
-            db.commit()
-            return user
-    # Brand-new user — create. Adopt legacy id=1 bots into them.
-    base = (email.split("@")[0] if email else f"user-{supabase_uid[:8]}")[:32] or f"user-{supabase_uid[:8]}"
-    username, suffix = base, 1
-    while db.query(models.User).filter(models.User.username == username).first():
-        username = f"{base}-{supabase_uid[:6]}{'' if suffix == 1 else suffix}"
-        suffix += 1
-        if suffix > 5:
-            username = f"user-{supabase_uid[:12]}"
-            break
-    user = models.User(
-        username=username, email=email or f"{supabase_uid}@cloud-sync.local",
-        hashed_password="", is_active=True, supabase_uid=supabase_uid,
-    )
-    db.add(user); db.commit(); db.refresh(user)
-    # Adopt legacy default-user bots if this is a fresh provision and they own none.
+    """For the desktop app (single-user install), the LOCAL user is always the
+    singleton id=1. We just stamp its supabase_uid + email so the cloud-side
+    knows who to push as. Bots stay owned by user_id=1 in the local DB so
+    the renderer (which uses get_default_user) sees them.
+
+    All Supabase-identified bots from the cloud are written into local SQLite
+    with user_id=1, regardless of which Supabase user owns them in the cloud.
+    The supabase_uid mapping for cloud writes lives on the User row, not on
+    individual Bot rows.
+
+    Bonus: any orphaned bots under other local user_ids (from earlier sync
+    bugs) get re-adopted into id=1 here — repairs the user_id=2 strand.
+    """
+    user = db.query(models.User).filter(models.User.id == 1).first()
+    if not user:
+        # Should never happen — ensure_default_user creates this on startup.
+        user = models.User(
+            id=1, username="watchdog", email="watchdog@local",
+            hashed_password="", is_active=True,
+        )
+        db.add(user); db.commit(); db.refresh(user)
+
+    # Order matters: clean up orphans BEFORE updating singleton's supabase_uid,
+    # because the partial unique index on (supabase_uid) WHERE NOT NULL would
+    # otherwise reject the singleton update if another user row already holds
+    # this supabase_uid (which it does — that's exactly the orphan we're
+    # repairing).
+
+    # 1) Move bots out of non-singleton user_ids → into id=1.
     try:
-        adopted = (db.query(models.Bot)
-                   .filter(models.Bot.user_id == 1, models.Bot.cloud_id.is_(None))
-                   .update({"user_id": user.id}, synchronize_session=False))
-        if adopted:
+        moved = (db.query(models.Bot)
+                 .filter(models.Bot.user_id != 1)
+                 .update({"user_id": 1}, synchronize_session=False))
+        if moved:
             db.commit()
-            log.info("adopted %d legacy bot(s) into user %s", adopted, supabase_uid[:8])
+            log.info("repaired ownership: moved %d bot(s) from non-singleton users to id=1", moved)
     except Exception as e:
         db.rollback()
-        log.warning("adoption failed: %s", e)
+        log.warning("ownership repair failed: %s", e)
+
+    # 2) Garbage-collect non-singleton user rows. Now they own no bots, so
+    #    the cascade-delete is a no-op for related tables.
+    try:
+        deleted = (db.query(models.User)
+                   .filter(models.User.id != 1)
+                   .delete(synchronize_session=False))
+        if deleted:
+            db.commit()
+            log.info("cleaned up %d orphan user row(s)", deleted)
+    except Exception as e:
+        db.rollback()
+        log.warning("orphan user cleanup failed: %s", e)
+
+    # 3) Now stamp supabase identity onto the singleton (no unique conflict).
+    changed = False
+    if user.supabase_uid != supabase_uid:
+        user.supabase_uid = supabase_uid; changed = True
+    if email and (not user.email or user.email == "watchdog@local"):
+        user.email = email; changed = True
+    if changed:
+        try:
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            log.warning("singleton stamp failed: %s", e)
+
     return user
 
 
@@ -307,9 +379,25 @@ def _run_one_cycle(client: httpx.Client) -> None:
     if not jwt or not supabase_uid:
         _set_status(state="paused", paused_reason="session.json missing access_token / user_id")
         return
-    if _is_jwt_expired(jwt):
-        _set_status(state="paused", paused_reason="JWT expired — Electron should refresh", supabase_uid=supabase_uid)
-        return
+    # Refresh proactively when we're inside a 60s window of expiry — saves
+    # one whole sync cycle of "paused" status while waiting for Electron to
+    # refresh the token (which it might never do if the renderer is closed).
+    if _is_jwt_expired(jwt, safety_margin_s=60):
+        refresh_token = sess.get("refresh_token")
+        log.info("JWT expired (or nearly) — attempting refresh via refresh_token")
+        new_sess = _refresh_session(refresh_token) if refresh_token else None
+        if new_sess and new_sess.get("access_token"):
+            # Merge: keep email if refresh response didn't return one.
+            new_sess.setdefault("email", sess.get("email"))
+            new_sess["saved_at"] = datetime.now(timezone.utc).isoformat()
+            _write_session(new_sess)
+            jwt = new_sess["access_token"]
+            log.info("JWT refreshed; continuing sync cycle with new token")
+        else:
+            _set_status(state="paused",
+                        paused_reason="JWT expired and refresh failed — sign in again",
+                        supabase_uid=supabase_uid)
+            return
     if not SUPABASE_URL or not SUPABASE_ANON_KEY:
         _set_status(state="paused", paused_reason="SUPABASE_URL / ANON_KEY not in env")
         return
@@ -337,8 +425,12 @@ def _run_one_cycle(client: httpx.Client) -> None:
             else:
                 # Conflict resolution: cloud wins iff cloud.updated_at >
                 # local.cloud_synced_at (when we last took cloud's value).
+                # SQLite drops tz info on DateTime columns; force both sides
+                # to tz-aware UTC before comparing or Python raises.
                 cloud_dt = _parse_iso(cb.get("updated_at"))
                 local_dt = local.cloud_synced_at
+                if local_dt is not None and local_dt.tzinfo is None:
+                    local_dt = local_dt.replace(tzinfo=timezone.utc)
                 if cloud_dt and (not local_dt or cloud_dt > local_dt):
                     if _apply_cloud_to_local(local, cb):
                         local.cloud_synced_at = cloud_dt
