@@ -310,58 +310,138 @@ async def get_current_user_supabase(
 # get cross-device sync until the next authenticated request.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Process-local set of Supabase UIDs we've already synced this run. Cleared on
-# restart, which is fine — has_migrated() in the cloud table is the long-term
-# truth.
-_synced_uids: set[str] = set()
-_synced_uids_lock = threading.Lock()
+# Throttle: re-pull from cloud at most once every N seconds per user. Without
+# this the auth dep would hit Supabase on every request. With it, the user
+# sees changes from another device within a few seconds of any authed call.
+_last_pull: dict[str, float] = {}                 # uid → epoch seconds
+_last_pull_lock = threading.Lock()
+_PULL_INTERVAL_S = 6.0                            # tune: lower = fresher, more bandwidth
+
+
+def _should_pull_now(uid: str) -> bool:
+    now = time.time()
+    with _last_pull_lock:
+        last = _last_pull.get(uid, 0.0)
+        if (now - last) < _PULL_INTERVAL_S:
+            return False
+        _last_pull[uid] = now
+        return True
+
+
+def _build_local_bot_from_cloud(user_id: int, cb: dict) -> "models.Bot":
+    """Translate a cloud `bots` row into a local SQLAlchemy Bot instance."""
+    return models.Bot(
+        user_id        = user_id,
+        cloud_id       = cb.get("id"),
+        cloud_synced_at= datetime.now(timezone.utc),
+        name           = cb.get("name") or "Untitled",
+        description    = cb.get("description"),
+        code           = cb.get("code") or "",
+        bot_type       = cb.get("bot_type"),
+        schedule_type  = cb.get("schedule_type") or "always",
+        schedule_start = cb.get("schedule_start"),
+        schedule_end   = cb.get("schedule_end"),
+        max_amount_per_trade    = cb.get("max_amount_per_trade"),
+        max_contracts_per_trade = cb.get("max_contracts_per_trade"),
+        max_daily_loss          = cb.get("max_daily_loss"),
+        auto_restart   = bool(cb.get("auto_restart") or False),
+    )
+
+
+def _apply_cloud_to_local_bot(local: "models.Bot", cb: dict) -> bool:
+    """Update an existing local Bot row from a cloud row. Returns True if
+    any field actually changed (so callers know whether to commit)."""
+    changed = False
+    for col_local, col_cloud in (
+        ("name", "name"), ("description", "description"), ("code", "code"),
+        ("bot_type", "bot_type"),
+        ("schedule_type", "schedule_type"),
+        ("schedule_start", "schedule_start"), ("schedule_end", "schedule_end"),
+        ("max_amount_per_trade", "max_amount_per_trade"),
+        ("max_contracts_per_trade", "max_contracts_per_trade"),
+        ("max_daily_loss", "max_daily_loss"),
+        ("auto_restart", "auto_restart"),
+    ):
+        v = cb.get(col_cloud)
+        if v is None:
+            continue
+        if getattr(local, col_local) != v:
+            setattr(local, col_local, v)
+            changed = True
+    if changed:
+        local.cloud_synced_at = datetime.now(timezone.utc)
+    return changed
 
 
 async def _maybe_sync_user(db: Session, user: "models.User", token: str) -> None:
-    """One-time cloud→local pull for a freshly-recognized Supabase user.
-    Imports lazily to avoid pulling cloud_client into request paths that
-    don't need it (e.g. local-only Whop sessions)."""
+    """Cloud↔local reconciliation for the current Supabase user. Runs at most
+    once every _PULL_INTERVAL_S seconds per user (throttle), never blocks
+    authentication on cloud failure.
+
+    Two phases, two transactions (so a failure in phase 2 doesn't undo phase 1):
+      Phase 1 — PULL: for every cloud bot, upsert the local row by cloud_id.
+                Adopt legacy default-user (id=1) bots into this user on first
+                run by re-attributing them.
+      Phase 2 — PUSH: any local bot for this user without a cloud_id gets
+                pushed up. Cloud returns the inserted rows; we match by
+                position (PostgREST preserves order) — not by name, which
+                isn't unique."""
     uid = user.supabase_uid
     if not uid:
         return
-    with _synced_uids_lock:
-        if uid in _synced_uids:
-            return
-        _synced_uids.add(uid)
+    if not _should_pull_now(uid):
+        return
 
     from . import cloud_client
-    try:
-        already = await cloud_client.has_migrated(token, uid)
-        cloud_bots = await cloud_client.list_cloud_bots(token) or []
 
-        # Pull cloud rows the local DB has never seen (no matching cloud_id).
-        new_locals = 0
+    # ── PHASE 0: Adopt legacy default-user bots (H6) ───────────────────────
+    # Only runs once: skipped if the user has any bots already. Re-attributes
+    # bots stranded under user_id=1 to the Supabase user so they sync up.
+    try:
+        already_owns = (db.query(models.Bot)
+                        .filter(models.Bot.user_id == user.id).count())
+        if already_owns == 0 and user.id != 1:
+            # Adopt the singleton "watchdog" user's bots — common for fresh
+            # Supabase logins on a desktop that previously ran legacy auth.
+            adopted = (db.query(models.Bot)
+                       .filter(models.Bot.user_id == 1)
+                       .update({"user_id": user.id}, synchronize_session=False))
+            if adopted:
+                db.commit()
+                print(f"[auth] adopted {adopted} legacy bot(s) into user {uid[:8]}")
+    except Exception as e:
+        db.rollback()
+        print(f"[auth] adoption skipped: {e}")
+
+    # ── PHASE 1: PULL cloud → local ───────────────────────────────────────
+    new_locals = 0
+    updated_locals = 0
+    cloud_bots: list = []
+    try:
+        cloud_bots = await cloud_client.list_cloud_bots(token) or []
         for cb in cloud_bots:
             cid = cb.get("id")
             if not cid:
                 continue
-            exists = db.query(models.Bot).filter(models.Bot.cloud_id == cid).first()
-            if exists:
-                continue
-            db.add(models.Bot(
-                user_id        = user.id,
-                cloud_id       = cid,
-                cloud_synced_at= datetime.now(timezone.utc),
-                name           = cb.get("name") or "Untitled",
-                description    = cb.get("description"),
-                code           = cb.get("code") or "",
-                bot_type       = cb.get("bot_type"),
-                schedule_type  = cb.get("schedule_type") or "always",
-                schedule_start = cb.get("schedule_start"),
-                schedule_end   = cb.get("schedule_end"),
-                max_amount_per_trade    = cb.get("max_amount_per_trade"),
-                max_contracts_per_trade = cb.get("max_contracts_per_trade"),
-                max_daily_loss          = cb.get("max_daily_loss"),
-                auto_restart   = bool(cb.get("auto_restart") or False),
-            ))
-            new_locals += 1
+            local = (db.query(models.Bot)
+                     .filter(models.Bot.cloud_id == cid).first())
+            if local:
+                if _apply_cloud_to_local_bot(local, cb):
+                    updated_locals += 1
+            else:
+                db.add(_build_local_bot_from_cloud(user.id, cb))
+                new_locals += 1
+        if new_locals or updated_locals:
+            db.commit()
+            print(f"[auth] cloud-sync pull: +{new_locals} new, {updated_locals} updated for {uid[:8]}")
+    except Exception as e:
+        db.rollback()
+        print(f"[auth] cloud-sync pull failed (will retry): {e}")
+        return  # don't attempt push if pull failed — likely network issue
 
-        # First-time push: any local bots NOT yet synced get pushed up.
+    # ── PHASE 2: PUSH local → cloud (only on first sync) ──────────────────
+    try:
+        already = await cloud_client.has_migrated(token, uid)
         if not already:
             local_unsynced = (db.query(models.Bot)
                               .filter(models.Bot.user_id == user.id,
@@ -369,26 +449,19 @@ async def _maybe_sync_user(db: Session, user: "models.User", token: str) -> None
                               .all())
             if local_unsynced:
                 inserted = await cloud_client.upsert_bots_batch(token, uid, local_unsynced)
-                # Match returned cloud rows back to local rows by name (the only
-                # field guaranteed to be unique-per-user in practice).
-                by_name = {row.get("name"): row.get("id") for row in inserted if row.get("id")}
-                for b in local_unsynced:
-                    cid = by_name.get(b.name)
+                # H4 fix: match by index (PostgREST guarantees response order
+                # mirrors request order) instead of by name (not unique).
+                for local_bot, cloud_row in zip(local_unsynced, inserted):
+                    cid = (cloud_row or {}).get("id")
                     if cid:
-                        b.cloud_id = cid
-                        b.cloud_synced_at = datetime.now(timezone.utc)
+                        local_bot.cloud_id = cid
+                        local_bot.cloud_synced_at = datetime.now(timezone.utc)
+                if local_unsynced:
+                    db.commit()
             await cloud_client.mark_migration_done(token, uid, len(local_unsynced))
-
-        db.commit()
-        if new_locals:
-            print(f"[auth] cloud-sync: pulled {new_locals} bot(s) from cloud for user {uid[:8]}")
     except Exception as e:
-        # Never let a sync failure break authentication. Roll back the partial
-        # state so the next request retries cleanly.
         db.rollback()
-        with _synced_uids_lock:
-            _synced_uids.discard(uid)
-        print(f"[auth] cloud-sync skipped (will retry next request): {e}")
+        print(f"[auth] cloud-sync push failed (will retry): {e}")
 
 
 async def get_current_user_cloud(

@@ -138,6 +138,33 @@ async def update_bot(jwt: str, cloud_id: str, bot: Any) -> bool:
         return False
 
 
+async def patch_bot_runtime(jwt: str, cloud_id: str, *, is_running: bool,
+                             running_on: Optional[str] = None) -> bool:
+    """Update only runtime fields (is_running, running_on, last_seen_at) on the
+    cloud bot row. Used by /run and /stop so the website fleet panel can show
+    'this bot is running on Sara's laptop' across devices."""
+    if not is_configured() or not cloud_id:
+        return False
+    url = f"{SUPABASE_URL}/rest/v1/bots?id=eq.{cloud_id}"
+    payload = {
+        "is_running":   is_running,
+        "last_seen_at": datetime.now(timezone.utc).isoformat(),
+        "status":       "running" if is_running else "stopped",
+    }
+    if running_on is not None:
+        payload["running_on"] = running_on
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            r = await c.patch(url, headers=_headers(jwt, prefer_return=False), json=payload)
+        if r.status_code not in (200, 204):
+            log.warning("[cloud] patch_bot_runtime %s: %s", r.status_code, r.text[:200])
+            return False
+        return True
+    except httpx.HTTPError as e:
+        log.warning("[cloud] patch_bot_runtime transport error: %s", e)
+        return False
+
+
 async def delete_bot(jwt: str, cloud_id: str) -> bool:
     """Delete an existing cloud row by its uuid. No-op if cloud_id is empty."""
     if not is_configured() or not cloud_id:

@@ -78,6 +78,20 @@ async def _cloud_update(token: str, cloud_id: str, bot_id: int):
 async def _cloud_delete(token: str, cloud_id: str):
     await cloud_client.delete_bot(token, cloud_id)
 
+# Hostname is captured once at import — used by patch_bot_runtime so the
+# website fleet panel can show "running on Sara's laptop".
+import socket as _socket
+_HOSTNAME = _socket.gethostname()
+
+async def _cloud_runtime(token: str, cloud_id: str, is_running: bool):
+    """Heartbeat one bot's runtime state to the cloud (is_running + last_seen
+    + running_on). Fire-and-forget; failures are logged inside cloud_client."""
+    await cloud_client.patch_bot_runtime(
+        token, cloud_id,
+        is_running=is_running,
+        running_on=_HOSTNAME if is_running else None,
+    )
+
 router = APIRouter(prefix="/api/bots", tags=["bots"])
 
 # In-memory process registry: {bot_id: subprocess.Popen}
@@ -656,6 +670,8 @@ def delete_bot(
 def run_bot(
     bot_id: int,
     body: BotRunIn = BotRunIn(),
+    request: Request = None,
+    background: BackgroundTasks = None,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
@@ -669,11 +685,23 @@ def run_bot(
         args=(bot_id, bot.code, user.id, body.demo_mode),
         daemon=True,
     ).start()
+    # H1: cloud heartbeat — flip is_running=true so the website fleet panel
+    # shows "running on <hostname>" across devices.
+    if _is_cloud_user(user) and bot.cloud_id and request is not None and background is not None:
+        token = _bearer_from_request(request)
+        if token:
+            background.add_task(_bg_run(_cloud_runtime(token, bot.cloud_id, True)))
     return {"message": "Bot started", "bot_id": bot_id, "demo_mode": body.demo_mode}
 
 
 @router.post("/{bot_id}/stop")
-def stop_bot(bot_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
+def stop_bot(
+    bot_id: int,
+    request: Request = None,
+    background: BackgroundTasks = None,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
     bot = db.query(models.Bot).filter(models.Bot.id == bot_id, models.Bot.user_id == user.id).first()
     if not bot:
         raise HTTPException(404, "Bot not found")
@@ -696,6 +724,11 @@ def stop_bot(bot_id: int, db: Session = Depends(get_db), user=Depends(get_curren
                     proc.kill()
                 except Exception:
                     pass
+    # H1: cloud heartbeat — flip is_running=false.
+    if _is_cloud_user(user) and bot.cloud_id and request is not None and background is not None:
+        token = _bearer_from_request(request)
+        if token:
+            background.add_task(_bg_run(_cloud_runtime(token, bot.cloud_id, False)))
     return {"message": "Bot stopped"}
 
 
