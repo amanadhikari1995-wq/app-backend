@@ -567,7 +567,13 @@ def create_bot(
         description=bot.description or "",
     )
     # ── Create AI Lab training data folder structure ──────────────────────────
-    _td_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'training_data'))
+    # WATCHDOG_DATA_DIR is set by run_backend.py in the bundled exe so
+    # writes go to %LOCALAPPDATA%\WatchDog\training_data, not under
+    # Program Files (denied). Falls back to repo-relative in dev mode.
+    _td_root = os.path.join(
+        os.environ.get("WATCHDOG_DATA_DIR") or os.path.abspath(
+            os.path.join(os.path.dirname(__file__), '..', '..')),
+        'training_data')
     _safe_name = re.sub(r'[^a-z0-9_]', '_', bot.name.lower())
     _bot_td = os.path.join(_td_root, f"bot_{bot.id}_{_safe_name}")
     for _sub in ["ticks", "trades", "sessions", "documents", "ai_decisions", "logs"]:
@@ -641,7 +647,13 @@ def delete_bot(
     # ── Delete the bot's isolated folder before removing from DB ─────────────
     _bot_fs(bot_id, bot.name).delete()
     # ── Delete the bot's AI Lab training data folder (all matching bot_{id}_*) ─
-    _td_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'training_data'))
+    # WATCHDOG_DATA_DIR is set by run_backend.py in the bundled exe so
+    # writes go to %LOCALAPPDATA%\WatchDog\training_data, not under
+    # Program Files (denied). Falls back to repo-relative in dev mode.
+    _td_root = os.path.join(
+        os.environ.get("WATCHDOG_DATA_DIR") or os.path.abspath(
+            os.path.join(os.path.dirname(__file__), '..', '..')),
+        'training_data')
     if os.path.isdir(_td_root):
         for _entry in os.scandir(_td_root):
             if _entry.is_dir() and _entry.name.startswith(f"bot_{bot_id}_"):

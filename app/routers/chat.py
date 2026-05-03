@@ -8,6 +8,7 @@ Real-time WebSocket + REST API.
 No external services required — pure FastAPI + SQLite.
 """
 
+import os
 import uuid
 import logging
 from pathlib import Path
@@ -26,9 +27,14 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 # ── Upload directories ────────────────────────────────────────────────────────
-_BACKEND = Path(__file__).parent.parent.parent   # app/backend/
-CHAT_DIR   = _BACKEND / "uploads" / "chat"
-AVATAR_DIR = _BACKEND / "uploads" / "avatars"
+# Use WATCHDOG_DATA_DIR (set by run_backend.py in the bundled exe) so we
+# write to %LOCALAPPDATA%\WatchDog\uploads\..., NOT under Program Files
+# where Windows denies write access. Fall back to the old __file__-based
+# path in dev mode (env var unset).
+_DATA_DIR = Path(os.environ.get("WATCHDOG_DATA_DIR")
+                 or Path(__file__).parent.parent.parent)
+CHAT_DIR   = _DATA_DIR / "uploads" / "chat"
+AVATAR_DIR = _DATA_DIR / "uploads" / "avatars"
 CHAT_DIR.mkdir(parents=True, exist_ok=True)
 AVATAR_DIR.mkdir(parents=True, exist_ok=True)
 

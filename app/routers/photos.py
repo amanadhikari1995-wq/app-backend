@@ -12,7 +12,14 @@ from .. import models
 
 router = APIRouter(prefix="/api/photos", tags=["photos"])
 
-UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "uploads", "photos")
+# Use WATCHDOG_DATA_DIR (set by run_backend.py in the bundled exe) so we
+# write to %LOCALAPPDATA%\WatchDog\uploads\photos, NOT under Program Files
+# where Windows denies write access. Fall back to the old __file__-based
+# path in dev mode (env var unset).
+_DATA_DIR = os.environ.get("WATCHDOG_DATA_DIR") or os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..")
+)
+UPLOAD_DIR = os.path.join(_DATA_DIR, "uploads", "photos")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 ALLOWED = {"image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp"}
