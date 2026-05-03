@@ -604,17 +604,29 @@ class CloudConnector:
         log.info("RPC %s %s (req=%s)", method, path, request_id[:8] if request_id else "?")
 
         try:
+            # Forward the Supabase JWT so the local FastAPI backend can identify
+            # the correct cloud user via get_current_user_cloud.  Using the local
+            # admin-login token (user_id=1) breaks multi-user setups where bots
+            # have been migrated to the Supabase user's own user_id after first
+            # sign-in — the admin token would return an empty bot list.
+            token = await self._auth.ensure_valid_token()
+            auth_headers = {"Authorization": f"Bearer {token}"}
+
             r = await self._local._client.request(
                 method, path,
-                headers=self._local._auth_headers(),
+                headers=auth_headers,
                 json=body if body is not None else None,
             )
-            # Reauth on 401 once
+            # Reauth on 401 once — token may have just expired
             if r.status_code == 401:
-                await self._local._login()
+                try:
+                    token = await self._auth.refresh()
+                    auth_headers = {"Authorization": f"Bearer {token}"}
+                except Exception as ref_err:
+                    log.warning("Token refresh failed during RPC reauth: %s", ref_err)
                 r = await self._local._client.request(
                     method, path,
-                    headers=self._local._auth_headers(),
+                    headers=auth_headers,
                     json=body if body is not None else None,
                 )
 
