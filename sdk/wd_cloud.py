@@ -518,22 +518,24 @@ class CloudConnector:
 
     async def _send_bots_list(self) -> None:
         bots = await self._local.list_bots()
-        await self._send({"type": "bots_list", "data": bots})
+        await self._send({"type": "bots_list", "bots": bots})
         log.info("Sent bots_list (%d bots) to cloud dashboard", len(bots))
 
-    async def _send_status_update(self, bot_id: int, status: str, logs: str = "") -> None:
+    async def _send_status_update(self, bot_id: int, status: str, error: str = "") -> None:
         await self._send({
-            "type": "status_update",
-            "data": {"bot_id": bot_id, "status": status, "logs": logs},
+            "type":   "status_update",
+            "botId":  str(bot_id),
+            "status": status,
+            "error":  error if error else None,
         })
-        log.info("Sent status_update bot_id=%d status=%s", bot_id, status)
+        log.info("Sent status_update botId=%s status=%s", bot_id, status)
 
     # ── command handlers ──────────────────────────────────────────────────────
 
-    async def _handle_run(self, data: Dict[str, Any]) -> None:
-        bot_id = data.get("bot_id")
+    async def _handle_run(self, msg: Dict[str, Any]) -> None:
+        bot_id = msg.get("botId") or msg.get("bot_id")
         if bot_id is None:
-            log.warning("run command missing bot_id")
+            log.warning("run command missing botId")
             return
         log.info("Dashboard requested START for bot %s", bot_id)
         await self._send_status_update(bot_id, "starting")
@@ -542,10 +544,10 @@ class CloudConnector:
         await self._send_status_update(bot_id, status,
                                        "" if ok else "Failed to start bot")
 
-    async def _handle_stop(self, data: Dict[str, Any]) -> None:
-        bot_id = data.get("bot_id")
+    async def _handle_stop(self, msg: Dict[str, Any]) -> None:
+        bot_id = msg.get("botId") or msg.get("bot_id")
         if bot_id is None:
-            log.warning("stop command missing bot_id")
+            log.warning("stop command missing botId")
             return
         log.info("Dashboard requested STOP for bot %s", bot_id)
         await self._send_status_update(bot_id, "stopping")
@@ -641,15 +643,14 @@ class CloudConnector:
             return
 
         msg_type = msg.get("type", "")
-        data     = msg.get("data", {})
         log.debug("← [cloud] %s", msg_type)
 
         if msg_type == "run":
-            await self._handle_run(data)
+            await self._handle_run(msg)
         elif msg_type == "stop":
-            await self._handle_stop(data)
+            await self._handle_stop(msg)
         elif msg_type == "list_request":
-            await self._handle_list_request(data)
+            await self._handle_list_request(msg)
         elif msg_type == "rpc_request":
             await self._handle_rpc_request(msg)
         elif msg_type in ("subscribe", "unsubscribe"):
@@ -867,18 +868,45 @@ async def _main() -> None:
     local = LocalBackendClient()
     api   = CloudApiClient(auth)
 
-    try:
-        # Login
-        await auth.login()
+    # Startup retry loop — auth failures (session.json not yet written,
+    # network down at boot) used to crash the process non-zero, consuming
+    # the supervisor respawn budget and ending in permanent failure.
+    # Now we retry internally with backoff so the supervisor is only
+    # needed for hard crashes, not transient startup issues.
+    _startup_delay = 5.0
+    while True:
+        try:
+            await auth.login()
+            break   # login succeeded
+        except KeyboardInterrupt:
+            log.info("Interrupted during startup")
+            await auth.close()
+            await local.close()
+            await api.close()
+            return
+        except Exception as _startup_err:
+            log.error("Startup login failed: %s — retrying in %.0fs",
+                      _startup_err, _startup_delay)
+            await asyncio.sleep(_startup_delay)
+            _startup_delay = min(_startup_delay * 2, 60.0)
+            try: await auth.close()
+            except Exception: pass
+            auth = CloudAuth()
+            api  = CloudApiClient(auth)
 
+    try:
         # Verify profile is reachable
         me = await api.get_me()
         if me:
             log.info("Logged in as: %s", me.get("email", "unknown"))
 
-        # Subscription gate — comment out if you want to bypass
+        # Subscription gate — warn only, never exit.
+        # A transient network error returning None here previously caused
+        # sys.exit(1) → Electron supervisor crashed 8x with backoff
+        # then marked the service failedPermanently → "Desktop Not Connected"
+        # forever. Now we log a warning and keep running.
         if not await _check_subscription(api):
-            sys.exit(1)
+            log.warning("Subscription check failed — relay running in degraded mode")
 
         # Attempt local backend login (non-fatal if local is offline)
         try:
