@@ -26,6 +26,8 @@ import os
 import sys
 import pathlib
 import logging
+import traceback
+import datetime
 
 # Force UTF-8 stdout/stderr so emoji + non-ASCII log lines don't crash
 # on Windows under the default cp1252 codepage.
@@ -34,6 +36,58 @@ try:
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
+
+
+def _emergency_crash_dump(exc_type, exc_value, tb):
+    """
+    Last-resort crash logger.
+
+    The bundled-exe failure mode that prompted this code: backend.log shows
+    "Booting WATCH-DOG backend — data dir: …" then nothing, the process
+    exits, and electron's supervisor respawns it 5× with the same silent
+    crash. The user's only window into the failure is backend.log — but
+    Python's default sys.excepthook prints the traceback to stderr, which
+    in a frozen exe vanishes (Electron pipes it to the main-process console
+    that end users never see).
+
+    This hook writes the full traceback to backend.crash.log inside the
+    same logs dir as backend.log. We write to a SEPARATE file (not
+    backend.log) so the crash is easy to find even when the root logger is
+    in an unknown state, and so the dump survives even if the root logger
+    initialised with bad handlers (which is itself a possible cause of
+    the silent crash).
+    """
+    try:
+        log_dir = os.environ.get("WATCHDOG_LOG_DIR")
+        if not log_dir:
+            # Best-effort fallback to the same dir we'd compute ourselves
+            base = os.environ.get("LOCALAPPDATA") or str(pathlib.Path.home() / "AppData" / "Local")
+            log_dir = str(pathlib.Path(base) / "WatchDog" / "logs")
+        pathlib.Path(log_dir).mkdir(parents=True, exist_ok=True)
+        crash_path = pathlib.Path(log_dir) / "backend.crash.log"
+        with open(crash_path, "a", encoding="utf-8", errors="replace") as f:
+            f.write(f"\n{'=' * 72}\n")
+            f.write(f"CRASH @ {datetime.datetime.now().isoformat(timespec='seconds')}\n")
+            f.write(f"  argv         : {sys.argv}\n")
+            f.write(f"  executable   : {sys.executable}\n")
+            f.write(f"  frozen       : {getattr(sys, 'frozen', False)}\n")
+            f.write(f"  _MEIPASS     : {getattr(sys, '_MEIPASS', None)}\n")
+            f.write(f"  cwd          : {os.getcwd()}\n")
+            f.write(f"  python ver   : {sys.version}\n")
+            f.write(f"{'-' * 72}\n")
+            traceback.print_exception(exc_type, exc_value, tb, file=f)
+            f.write(f"{'=' * 72}\n")
+    except Exception:
+        # Absolutely nothing we can do — fall through to default handler.
+        pass
+    # Always also write to stderr for the Electron console.
+    sys.__excepthook__(exc_type, exc_value, tb)
+
+
+# Install the hook IMMEDIATELY, before we touch anything else. If a crash
+# happens during module-level imports of app.main, _bootstrap_paths(), or
+# even logging.basicConfig itself, we still capture it.
+sys.excepthook = _emergency_crash_dump
 
 
 def _user_data_dir() -> pathlib.Path:
@@ -139,10 +193,33 @@ def main() -> None:
     )
     log = logging.getLogger("watchdog.bootstrap")
     log.info("Booting WATCH-DOG backend — data dir: %s", os.environ["WATCHDOG_DATA_DIR"])
+    # Diagnostic line: lets us see at a glance whether we're running as the
+    # PyInstaller --onedir exe vs. a stray python.exe, and where _MEIPASS
+    # points (a common silent-crash cause is _MEIPASS missing dlls/.pyd).
+    log.info(
+        "Boot env — frozen=%s _MEIPASS=%s exe=%s argv=%s",
+        getattr(sys, "frozen", False),
+        getattr(sys, "_MEIPASS", None),
+        sys.executable,
+        sys.argv,
+    )
 
     # Import the FastAPI app AFTER paths are bootstrapped — some modules
     # touch the filesystem on import (e.g. database.py creates the DB).
-    from app.main import app
+    #
+    # Wrapped in try/except because a ModuleNotFoundError or any other
+    # import-time failure here is THE most common silent-crash cause for
+    # the bundled exe, and Python's default behaviour is to print to stderr
+    # and exit — which in a frozen exe means the failure is invisible to the
+    # user (backend.log only shows "Booting…" and stops). Logging with
+    # exc_info=True writes the full traceback into backend.log so the next
+    # time this happens, the user can see what failed.
+    try:
+        from app.main import app
+    except Exception:
+        log.critical("FATAL: failed to import app.main — backend cannot start", exc_info=True)
+        # Re-raise so sys.excepthook (above) ALSO writes to backend.crash.log.
+        raise
 
     import uvicorn
     import socket
@@ -204,16 +281,36 @@ def main() -> None:
         return  # clean exit, no error spam
 
     log.info("Starting uvicorn on %s:%d", host, port)
-    uvicorn.run(
-        app,
-        host=host,
-        port=port,
-        log_level="info",
-        access_log=False,
-        reload=False,           # MUST be False inside a frozen exe
-        workers=1,
-    )
+    # Same try/except rationale as the import above — a uvicorn startup
+    # failure (port stolen mid-flight, FastAPI lifespan crash, etc.)
+    # otherwise vanishes to stderr and the user sees "backend unreachable".
+    try:
+        uvicorn.run(
+            app,
+            host=host,
+            port=port,
+            log_level="info",
+            access_log=False,
+            reload=False,           # MUST be False inside a frozen exe
+            workers=1,
+        )
+    except Exception:
+        log.critical("FATAL: uvicorn.run raised — backend exited", exc_info=True)
+        raise
 
 
 if __name__ == "__main__":
-    main()
+    # Outer guard. Even though sys.excepthook is installed at module load,
+    # explicitly wrapping main() here means a crash that happens BEFORE
+    # logging.basicConfig (e.g. inside _bootstrap_paths if %LOCALAPPDATA%
+    # is unwritable) still produces a backend.crash.log dump and a
+    # non-zero exit — which is the contract backend-runner.js's supervisor
+    # expects when deciding whether to respawn.
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException:
+        # Trigger our excepthook explicitly (sys.exit will skip it).
+        _emergency_crash_dump(*sys.exc_info())
+        sys.exit(1)
