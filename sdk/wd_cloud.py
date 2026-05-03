@@ -31,11 +31,14 @@ Optional overrides:
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import logging
 import os
+import pathlib
 import sys
 import time
+import traceback
 from typing import Any, Dict, Optional
 
 # Reconfigure stdout/stderr to UTF-8 so emoji + Unicode log lines don't
@@ -55,12 +58,60 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Logging ────────────────────────────────────────────────────────────────────
+# Two handlers: console (Electron captures stdout for the main-process console)
+# AND a file in the user's WatchDog logs dir so end users can SEE what the
+# cloud connector is doing. Without the file handler, every failure here is
+# invisible — there's no way to debug "watchdog-cloud.exe not running".
+def _user_log_dir() -> pathlib.Path:
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or str(pathlib.Path.home() / "AppData" / "Local")
+    elif sys.platform == "darwin":
+        base = str(pathlib.Path.home() / "Library" / "Application Support")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or str(pathlib.Path.home() / ".local" / "share")
+    p = pathlib.Path(base) / "WatchDog" / "logs"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+_LOG_DIR = _user_log_dir()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     datefmt="%H:%M:%S",
+    handlers=[
+        logging.FileHandler(_LOG_DIR / "cloud.log", encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
 )
 log = logging.getLogger("wd_cloud")
+
+
+def _emergency_crash_dump(exc_type, exc_value, tb):
+    """
+    Last-resort crash logger — same pattern as run_backend.py.
+    Writes the full traceback + boot diagnostics to cloud.crash.log so
+    a silent crash is still visible to the end user.
+    """
+    try:
+        crash_path = _LOG_DIR / "cloud.crash.log"
+        with open(crash_path, "a", encoding="utf-8", errors="replace") as f:
+            f.write(f"\n{'=' * 72}\n")
+            f.write(f"CRASH @ {datetime.datetime.now().isoformat(timespec='seconds')}\n")
+            f.write(f"  argv         : {sys.argv}\n")
+            f.write(f"  executable   : {sys.executable}\n")
+            f.write(f"  frozen       : {getattr(sys, 'frozen', False)}\n")
+            f.write(f"  _MEIPASS     : {getattr(sys, '_MEIPASS', None)}\n")
+            f.write(f"  cwd          : {os.getcwd()}\n")
+            f.write(f"  python ver   : {sys.version}\n")
+            f.write(f"{'-' * 72}\n")
+            traceback.print_exception(exc_type, exc_value, tb, file=f)
+            f.write(f"{'=' * 72}\n")
+    except Exception:
+        pass
+    sys.__excepthook__(exc_type, exc_value, tb)
+
+
+sys.excepthook = _emergency_crash_dump
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 CLOUD_API_URL  = os.getenv("CLOUD_API_URL",  "https://watchdogbot.cloud").rstrip("/")
@@ -803,11 +854,15 @@ async def _check_subscription(api: CloudApiClient) -> bool:
 # 6. ENTRY POINT
 # ──────────────────────────────────────────────────────────────────────────────
 async def _main() -> None:
-    if not CLOUD_EMAIL or not CLOUD_PASSWORD:
-        print("\n[X] CLOUD_EMAIL and CLOUD_PASSWORD must be set in your .env file.")
-        print("    Add them and re-run.\n")
-        sys.exit(1)
-
+    # NOTE: do NOT early-exit on missing CLOUD_EMAIL/CLOUD_PASSWORD here.
+    # CloudAuth.login() tries 3 sources in order:
+    #   1. session.json (real installs — Electron writes this on user login)
+    #   2. WATCHDOG_AUTH_TOKEN env (test/CI)
+    #   3. CLOUD_EMAIL + CLOUD_PASSWORD env (legacy/dev)
+    # The previous guard checked only path 3 and exited if those env vars
+    # weren't set, killing the connector for every real desktop install
+    # (which uses path 1). If NO auth path is available, CloudAuth.login()
+    # raises a clear RuntimeError that the try/except below logs.
     auth  = CloudAuth()
     local = LocalBackendClient()
     api   = CloudApiClient(auth)
