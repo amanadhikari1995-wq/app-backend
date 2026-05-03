@@ -364,6 +364,50 @@ def _local_user_for_supabase(db: Session, supabase_uid: str, email: Optional[str
         db.rollback()
         log.warning("orphan user cleanup failed: %s", e)
 
+    # 2.5) USER SWITCH: if the singleton was previously stamped with a
+    # DIFFERENT supabase_uid, the previous user's bots/connections/etc are
+    # still owned by user_id=1 in local SQLite. The renderer (which reads
+    # all rows for user_id=1) would show the previous user's data to the
+    # new user — and any sync push would also leak the previous user's
+    # data to the new user's cloud account. Wipe per-user data BEFORE
+    # stamping the new identity.
+    #
+    # Skipped on first ever sign-in (previous_uid is None) and on sign-in
+    # of the same user again (uids match — handled by the no-op branch
+    # below).
+    previous_uid = user.supabase_uid
+    if previous_uid and previous_uid != supabase_uid:
+        log.warning(
+            "user switch detected on local install: %s… → %s… — wiping "
+            "previous user's local data before pulling new user's cloud state",
+            previous_uid[:8], supabase_uid[:8],
+        )
+        wipe_tables = [
+            ("bots",             models.Bot),
+            ("bot_logs",         models.BotLog),
+            ("api_connections",  models.ApiConnection),
+            ("trades",           models.Trade),
+            ("ai_models",        models.AIModel),
+            ("training_runs",    models.TrainingRun),
+            ("model_files",      models.ModelFile),
+            ("whop_memberships", models.WhopMembership),
+        ]
+        for label, model in wipe_tables:
+            try:
+                n = (db.query(model)
+                     .filter(model.user_id == 1)
+                     .delete(synchronize_session=False))
+                if n:
+                    log.info("user-switch wipe: removed %d %s row(s)", n, label)
+            except Exception as e:
+                db.rollback()
+                log.warning("user-switch wipe %s failed: %s", label, e)
+        try:
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            log.warning("user-switch wipe commit failed: %s", e)
+
     # 3) Now stamp supabase identity onto the singleton (no unique conflict).
     changed = False
     if user.supabase_uid != supabase_uid:
