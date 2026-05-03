@@ -3,7 +3,19 @@
 # PyInstaller spec for the WATCH-DOG FastAPI backend.
 # Run:  pyinstaller backend.spec --clean
 #
-# Produces a single-file watchdog-backend.exe in dist/.
+# Produces a folder dist/watchdog-backend/ containing watchdog-backend.exe
+# plus all DLLs/datas alongside it (--onedir mode).
+#
+# Why --onedir not --onefile: --onefile bundles everything into a single exe
+# that, when launched, EXTRACTS itself to %TEMP%, then spawns the REAL
+# Python process as a child. Result: 2 entries per Python service in
+# Task Manager (bootloader + extracted process). Users (correctly) see
+# this as confusing duplicate processes.
+#
+# --onedir ships the unpacked contents alongside the exe up front. No
+# extraction at launch, no bootloader child process. Task Manager shows
+# exactly ONE entry per service. Trade-off: install footprint is the same
+# total size, just spread across many files instead of one big exe.
 #
 # Why this is more than just `--onefile`: FastAPI + uvicorn + langchain +
 # ccxt + apscheduler all use deferred / dynamic imports that PyInstaller's
@@ -148,21 +160,28 @@ pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
     [],
+    exclude_binaries=True,            # --onedir: binaries go in COLLECT, not the exe
     name='watchdog-backend',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=False,                       # UPX often triggers AV false positives
-    upx_exclude=[],
-    runtime_tmpdir=None,
-    console=True,                    # keep console for now — easy debugging
+    upx=False,                        # UPX often triggers AV false positives
+    console=True,                     # keep console for now — easy debugging
     disable_windowed_traceback=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
     icon='../frontend/build/icon.ico' if __import__('os').path.exists('../frontend/build/icon.ico') else None,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='watchdog-backend',          # output folder: dist/watchdog-backend/
 )
