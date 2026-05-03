@@ -464,7 +464,7 @@ class LocalBackendClient:
 
     async def start_bot(self, bot_id: int) -> bool:
         """Start a bot. Returns True on success."""
-        result = await self._post(f"/api/bots/{bot_id}/start")
+        result = await self._post(f"/api/bots/{bot_id}/run")
         return result is not None
 
     async def stop_bot(self, bot_id: int) -> bool:
