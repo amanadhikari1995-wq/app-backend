@@ -74,7 +74,56 @@ def _resource_path(relative: str) -> str:
     return os.path.join(base, relative)
 
 
+def _maybe_run_as_python() -> bool:
+    """If we were invoked with a script argument (e.g. by bots router doing
+    `subprocess.Popen([sys.executable, '-u', wd_runner.py, tmp_path])`),
+    act as a Python interpreter executing that script.
+
+    In a frozen PyInstaller exe, sys.executable IS this exe — not python.exe.
+    Without this branch, the bot subprocess just re-runs the backend
+    server, hits the port pre-flight, and exits. Bots never actually
+    execute their code.
+
+    Returns True if we ran a script (caller should NOT run the backend).
+    """
+    args = sys.argv[1:]
+    # Skip leading -u, -B, -O, etc. Python flags so we accept the same
+    # CLI shape the rest of the codebase uses with sys.executable.
+    while args and args[0].startswith('-') and len(args[0]) <= 3:
+        args.pop(0)
+    if not args:
+        return False
+    script = args[0]
+    if not script.lower().endswith('.py'):
+        return False
+    if not os.path.exists(script):
+        return False
+
+    # Bootstrap paths so the script (e.g. wd_runner.py) inherits the same
+    # WATCHDOG_DATA_DIR + WATCHDOG_LOG_DIR env the backend uses.
+    _bootstrap_paths()
+
+    # Replace sys.argv with [script, *script_args] so the script sees
+    # itself as argv[0] (matches `python script.py args` behavior).
+    sys.argv = [script] + args[1:]
+    # Ensure the script's directory is on sys.path so its sibling imports
+    # work (Python normally does this for the main script).
+    script_dir = os.path.dirname(os.path.abspath(script))
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+
+    import runpy
+    runpy.run_path(script, run_name='__main__')
+    return True
+
+
 def main() -> None:
+    # Bot-runner mode: when invoked with a script argument, behave like
+    # `python <script>` instead of starting the backend server. This is
+    # the path bots router takes when spawning a bot subprocess.
+    if _maybe_run_as_python():
+        return
+
     _bootstrap_paths()
 
     # Configure logging to a file in the user dir, plus console
@@ -138,8 +187,11 @@ def main() -> None:
             s.close()
 
     if _is_port_in_use(host, port):
-        log.warning("Port %s:%d is already serving — assuming a sibling watchdog-backend "
-                    "instance won the race. Exiting silently to avoid duplicate.", host, port)
+        # INFO not WARNING — this is the expected, healthy outcome when a
+        # sibling instance has already bound the port. Service.start() in
+        # backend-runner.js sees code=0 and correctly does not respawn.
+        log.info("Port %s:%d already serving — sibling watchdog-backend instance "
+                 "won the race. This process exiting cleanly (code 0).", host, port)
         return  # clean exit, Service won't respawn
 
     for attempt in range(12):

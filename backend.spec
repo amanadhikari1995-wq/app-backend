@@ -124,6 +124,12 @@ datas += collect_data_files('langchain_community')
 datas += collect_data_files('ccxt')
 datas += collect_data_files('email_validator')
 
+# sdk/ — bot runtime helpers (wd_runner.py + wd_autolog + wd_log + wd_session).
+# These are loaded by os.path.join from app/routers/bots.py, NOT via Python
+# import, so PyInstaller's static analysis misses them. Without this, every
+# bot launch fails because subprocess can't find wd_runner.py.
+datas += [('sdk', 'sdk')]
+
 
 # ── Native libraries (e.g. bcrypt's _bcrypt.cpython.pyd) ─────────────────
 binaries  = []
