@@ -215,53 +215,61 @@ async def _validate_with_supabase(token: str) -> Optional[dict]:
 
 
 def _provision_user_from_supabase(db: Session, sb_user: dict) -> models.User:
-    """Find or create a local `User` row matching this Supabase identity.
-    Two lookup paths:
-      1. supabase_uid match — the canonical case after first provision.
-      2. email match — for users whose local row predates this column;
-         we adopt the row by stamping its supabase_uid + commit."""
+    """SINGLE-USER DESKTOP MODEL.
+
+    The desktop app is, in practice, single-user: one human signs into one
+    Windows account and uses one WatchDog install. We therefore collapse
+    every Supabase identity onto the LOCAL singleton (id=1). Storing the
+    supabase_uid on that singleton is enough to identify the user to the
+    cloud — no need for a parallel local user_id=2.
+
+    Why this matters: previously this function created a SECOND local user
+    row when a Supabase JWT validated. The renderer's CRUD then attributed
+    bots to user_id=2, while the sync_engine kept moving them back to
+    user_id=1, and the two paths fought every cycle. Single-user model =
+    no fight = bots stay where they are.
+
+    The supabase_uid + email get stamped onto user_id=1 idempotently.
+    Existing user_id != 1 rows are NOT touched here — sync_engine handles
+    cleanup of those, and we want this dep to be fast (no DELETEs).
+    """
     uid   = sb_user["id"]
-    email = (sb_user.get("email") or "").lower().strip()
-    meta  = sb_user.get("user_metadata") or {}
-    display_name = (
-        meta.get("full_name") or meta.get("display_name") or meta.get("name")
-        or (email.split("@")[0] if email else f"user-{uid[:8]}")
-    )
+    email = (sb_user.get("email") or "").lower().strip() or None
 
-    user = db.query(models.User).filter(models.User.supabase_uid == uid).first()
-    if user:
-        return user
+    user = db.query(models.User).filter(models.User.id == 1).first()
+    if not user:
+        # Should never happen — ensure_default_user creates this on startup.
+        user = models.User(
+            id=1, username="watchdog", email="watchdog@local",
+            hashed_password="", is_active=True,
+        )
+        db.add(user); db.commit(); db.refresh(user)
 
-    if email:
-        user = db.query(models.User).filter(models.User.email == email).first()
-        if user:
+    # Idempotent stamp. We only update if the value actually differs to
+    # avoid no-op writes that touch updated_at (the Bot table has triggers
+    # in some configs).
+    changed = False
+    if user.supabase_uid != uid:
+        # Defensive: if a different row already holds this uid (legacy
+        # orphan), unique-index UPDATE would fail. Sync engine cleans those
+        # up; here we just skip the stamp on conflict — next request will
+        # try again after sync engine clears the orphan.
+        existing = (db.query(models.User)
+                    .filter(models.User.supabase_uid == uid,
+                            models.User.id != 1).first())
+        if not existing:
             user.supabase_uid = uid
+            changed = True
+    if email and (not user.email or user.email == "watchdog@local") and user.email != email:
+        user.email = email
+        changed = True
+    if changed:
+        try:
             db.commit()
-            db.refresh(user)
-            return user
-
-    # Brand-new user — create the row. username MUST be unique; we add a
-    # short uid suffix if there's already a row with the same username.
-    base_username = display_name[:32] or f"user-{uid[:8]}"
-    username = base_username
-    suffix = 1
-    while db.query(models.User).filter(models.User.username == username).first():
-        username = f"{base_username}-{uid[:6]}{'' if suffix == 1 else suffix}"
-        suffix += 1
-        if suffix > 5:
-            username = f"user-{uid[:12]}"
-            break
-
-    user = models.User(
-        username=username,
-        email=email or f"{uid}@cloud-sync.local",
-        hashed_password="",          # Supabase owns the password
-        is_active=True,
-        supabase_uid=uid,
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
+        except Exception:
+            db.rollback()
+            # Don't let a stamp failure block the request — caller still
+            # gets the singleton user, which is what they need.
     return user
 
 

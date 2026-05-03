@@ -323,20 +323,36 @@ def _local_user_for_supabase(db: Session, supabase_uid: str, email: Optional[str
     # this supabase_uid (which it does — that's exactly the orphan we're
     # repairing).
 
-    # 1) Move bots out of non-singleton user_ids → into id=1.
-    try:
-        moved = (db.query(models.Bot)
-                 .filter(models.Bot.user_id != 1)
+    # 1) Move ALL user-owned rows from any non-singleton user_id → id=1.
+    #    Bots first, then dependent tables (bot_logs, trades, ai_models,
+    #    training_runs, model_files, whop_memberships) that have FK to user.
+    #    Doing this before user delete avoids FOREIGN KEY violations.
+    repair_tables = [
+        ("bots",            models.Bot),
+        ("bot_logs",        models.BotLog),
+        ("trades",          models.Trade),
+        ("ai_models",       models.AIModel),
+        ("training_runs",   models.TrainingRun),
+        ("model_files",     models.ModelFile),
+        ("whop_memberships", models.WhopMembership),
+    ]
+    total_moved = 0
+    for label, model in repair_tables:
+        try:
+            n = (db.query(model)
+                 .filter(model.user_id != 1)
                  .update({"user_id": 1}, synchronize_session=False))
-        if moved:
-            db.commit()
-            log.info("repaired ownership: moved %d bot(s) from non-singleton users to id=1", moved)
-    except Exception as e:
-        db.rollback()
-        log.warning("ownership repair failed: %s", e)
+            if n:
+                db.commit()
+                total_moved += n
+                log.info("repaired ownership: moved %d %s row(s) to user_id=1", n, label)
+        except Exception as e:
+            db.rollback()
+            log.warning("ownership repair %s failed: %s", label, e)
 
-    # 2) Garbage-collect non-singleton user rows. Now they own no bots, so
-    #    the cascade-delete is a no-op for related tables.
+    # 2) Garbage-collect non-singleton user rows. They own nothing now.
+    #    Use raw SQL DELETE through SQLAlchemy bulk; FK should not fire
+    #    because step 1 cleared everything.
     try:
         deleted = (db.query(models.User)
                    .filter(models.User.id != 1)
