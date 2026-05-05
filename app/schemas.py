@@ -105,6 +105,7 @@ class BotOut(BaseModel):
     max_contracts_per_trade: Optional[int]
     max_daily_loss: Optional[float]
     auto_restart: bool
+    cloud_id: Optional[str] = None
     class Config:
         from_attributes = True
 
@@ -135,6 +136,7 @@ class ApiConnectionOut(BaseModel):
     base_url: Optional[str]
     api_key: Optional[str]
     is_active: bool
+    cloud_id: Optional[str] = None
     created_at: datetime
     class Config:
         from_attributes = True
