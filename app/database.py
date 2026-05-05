@@ -120,6 +120,21 @@ def ensure_columns() -> None:
         except Exception:
             pass
 
+        # api_connections.cloud_id — Supabase UUID link for write-through sync
+        try:
+            conn.execute(text("ALTER TABLE api_connections ADD COLUMN cloud_id VARCHAR"))
+            conn.commit()
+        except Exception:
+            pass
+        try:
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_api_connections_cloud_id "
+                "ON api_connections (cloud_id)"
+            ))
+            conn.commit()
+        except Exception:
+            pass
+
 
 def ensure_bot_folders() -> None:
     """
