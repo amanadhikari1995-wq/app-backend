@@ -54,6 +54,10 @@ class Bot(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     last_run_at = Column(DateTime(timezone=True), nullable=True)
 
+    # bot_type identifies the trading strategy type (e.g. "kalshi", "crypto")
+    # Synced bidirectionally with the Supabase bots table.
+    bot_type       = Column(String,  nullable=True)
+
     # Cloud-sync (step 3 of cloud-sync rollout). Populated when the row is
     # mirrored to the Supabase `bots` table; null for bots that haven't synced
     # yet (offline create, legacy default-user bots before migration).
