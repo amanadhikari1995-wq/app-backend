@@ -507,6 +507,13 @@ def _execute(bot_id: int, code: str, user_id: int, demo_mode: bool = False):
                 db.commit()
                 if bfs:
                     bfs.sync_status(final_status.value)
+                # Push final status to Supabase Realtime (bot exited naturally)
+                try:
+                    import asyncio as _aio
+                    from .. import supabase_rt as _srt
+                    _aio.run(_srt.push_bot_status(bot.id))
+                except Exception:
+                    pass
             break
 
     except Exception as exc:
@@ -526,6 +533,13 @@ def _execute(bot_id: int, code: str, user_id: int, demo_mode: bool = False):
             if bot:
                 bot.status = models.BotStatus.ERROR
                 db.commit()
+                # Push error status to Supabase Realtime
+                try:
+                    import asyncio as _aio
+                    from .. import supabase_rt as _srt
+                    _aio.run(_srt.push_bot_status(bot.id))
+                except Exception:
+                    pass
         except Exception:
             pass
         if bfs:
