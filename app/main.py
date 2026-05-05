@@ -19,7 +19,8 @@ def _run_migrations():
         "ALTER TABLE api_connections ADD COLUMN bot_id INTEGER REFERENCES bots(id)",
         # v3.2 — bot secret for trade recording
         "ALTER TABLE bots ADD COLUMN bot_secret TEXT NOT NULL DEFAULT ''",
-        # v3.3 — bot settings
+        # v3.3 — bot settings + bot_type
+        "ALTER TABLE bots ADD COLUMN bot_type TEXT",
         "ALTER TABLE bots ADD COLUMN schedule_type TEXT NOT NULL DEFAULT 'always'",
         "ALTER TABLE bots ADD COLUMN schedule_start TEXT",
         "ALTER TABLE bots ADD COLUMN schedule_end TEXT",
