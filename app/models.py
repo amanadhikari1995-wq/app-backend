@@ -101,6 +101,7 @@ class ApiConnection(Base):
     api_key = Column(String, nullable=True)
     api_secret = Column(String, nullable=True)
     is_active = Column(Boolean, default=True)
+    cloud_id = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     bot = relationship("Bot", back_populates="api_connections")
