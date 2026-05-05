@@ -82,6 +82,9 @@ APP_MODULES = [
     # so this MUST be explicit or sync_engine.py won't be in the exe and
     # cloud-sync silently degrades to local-only at every startup.
     'app.sync_engine',
+    # supabase_rt is imported lazily inside router functions (from .. import supabase_rt).
+    # Must be explicit for the same reason as sync_engine above.
+    'app.supabase_rt',
 ]
 
 # ── Submodules that PyInstaller's static analysis doesn't catch ──────────
