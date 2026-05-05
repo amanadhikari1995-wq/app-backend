@@ -115,8 +115,22 @@ async def lifespan(app: FastAPI):
     try:
         from . import sync_engine
         sync_engine.start()
+        print("[watchdog] sync engine started")
     except Exception as e:
-        log.warning("sync engine failed to start: %s", e)
+        print(f"[watchdog] sync engine failed to start: {e}")
+
+    # ── Supabase write-through startup pull ─────────────────────────────────
+    # One-shot pull of all cloud bots + connections into local SQLite so a
+    # freshly-launched desktop app immediately reflects any changes made from
+    # another device or the web dashboard.
+    try:
+        import threading as _threading
+        from . import supabase_rt as _srt
+        _threading.Thread(target=_srt.startup_pull, daemon=True, name="startup-pull").start()
+        print("[watchdog] startup pull triggered")
+    except Exception as e:
+        print(f"[watchdog] startup pull failed to start: {e}")
+
     # Reset any bots stuck in RUNNING from a previous server process — their
     # subprocesses are gone after a restart so the status must be corrected.
     try:
