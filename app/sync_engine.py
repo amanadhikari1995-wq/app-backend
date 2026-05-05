@@ -51,7 +51,7 @@ log = logging.getLogger("watchdog.sync")
 SUPABASE_URL      = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
 
-SYNC_INTERVAL_S   = float(os.getenv("WATCHDOG_SYNC_INTERVAL_S", "5.0"))
+SYNC_INTERVAL_S   = float(os.getenv("WATCHDOG_SYNC_INTERVAL_S", "30.0"))
 HTTP_TIMEOUT_S    = 10.0
 
 # Columns we mirror in both directions. Keep in lockstep with sql/cloud-sync.sql
@@ -327,42 +327,47 @@ def _local_user_for_supabase(db: Session, supabase_uid: str, email: Optional[str
     #    Bots first, then dependent tables (bot_logs, trades, ai_models,
     #    training_runs, model_files, whop_memberships) that have FK to user.
     #    Doing this before user delete avoids FOREIGN KEY violations.
-    repair_tables = [
-        ("bots",            models.Bot),
-        ("bot_logs",        models.BotLog),
-        ("trades",          models.Trade),
-        ("ai_models",       models.AIModel),
-        ("training_runs",   models.TrainingRun),
-        ("model_files",     models.ModelFile),
-        ("whop_memberships", models.WhopMembership),
-    ]
-    total_moved = 0
-    for label, model in repair_tables:
+    global _orphan_repair_done
+    if not _orphan_repair_done:
+        # Run ownership-repair SQL exactly once per process lifetime so we
+        # don't hammer SQLite with 8 UPDATE queries on every 30s cycle.
+        _orphan_repair_done = True
+        repair_tables = [
+            ("bots",            models.Bot),
+            ("bot_logs",        models.BotLog),
+            ("trades",          models.Trade),
+            ("ai_models",       models.AIModel),
+            ("training_runs",   models.TrainingRun),
+            ("model_files",     models.ModelFile),
+            ("whop_memberships", models.WhopMembership),
+        ]
+        total_moved = 0
+        for label, model in repair_tables:
+            try:
+                n = (db.query(model)
+                     .filter(model.user_id != 1)
+                     .update({"user_id": 1}, synchronize_session=False))
+                if n:
+                    db.commit()
+                    total_moved += n
+                    log.info("repaired ownership: moved %d %s row(s) to user_id=1", n, label)
+            except Exception as e:
+                db.rollback()
+                log.warning("ownership repair %s failed: %s", label, e)
+
+        # 2) Garbage-collect non-singleton user rows. They own nothing now.
+        #    Use raw SQL DELETE through SQLAlchemy bulk; FK should not fire
+        #    because step 1 cleared everything.
         try:
-            n = (db.query(model)
-                 .filter(model.user_id != 1)
-                 .update({"user_id": 1}, synchronize_session=False))
-            if n:
+            deleted = (db.query(models.User)
+                       .filter(models.User.id != 1)
+                       .delete(synchronize_session=False))
+            if deleted:
                 db.commit()
-                total_moved += n
-                log.info("repaired ownership: moved %d %s row(s) to user_id=1", n, label)
+                log.info("cleaned up %d orphan user row(s)", deleted)
         except Exception as e:
             db.rollback()
-            log.warning("ownership repair %s failed: %s", label, e)
-
-    # 2) Garbage-collect non-singleton user rows. They own nothing now.
-    #    Use raw SQL DELETE through SQLAlchemy bulk; FK should not fire
-    #    because step 1 cleared everything.
-    try:
-        deleted = (db.query(models.User)
-                   .filter(models.User.id != 1)
-                   .delete(synchronize_session=False))
-        if deleted:
-            db.commit()
-            log.info("cleaned up %d orphan user row(s)", deleted)
-    except Exception as e:
-        db.rollback()
-        log.warning("orphan user cleanup failed: %s", e)
+            log.warning("orphan user cleanup failed: %s", e)
 
     # 2.5) USER SWITCH: if the singleton was previously stamped with a
     # DIFFERENT supabase_uid, the previous user's bots/connections/etc are
@@ -566,6 +571,7 @@ def _run_one_cycle(client: httpx.Client) -> None:
 
 _thread: Optional[threading.Thread] = None
 _stop_event = threading.Event()
+_orphan_repair_done = False  # run ownership-repair SQL only once per process
 
 
 def _loop():
