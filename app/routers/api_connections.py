@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy.orm import Session
 from typing import List, Optional
 
@@ -51,6 +51,7 @@ def list_connections(
 @router.post("/", response_model=schemas.ApiConnectionOut, status_code=201)
 def create_connection(
     data: schemas.ApiConnectionCreate,
+    background: BackgroundTasks,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
@@ -67,6 +68,12 @@ def create_connection(
     # ── Mirror all connections for this bot to its isolated folder ────────────
     if data.bot_id is not None:
         _sync_bot_connections(data.bot_id, db)
+    # Immediate write-through to Supabase for zero-lag Realtime sync
+    try:
+        from .. import supabase_rt as _srt
+        background.add_task(_srt.push_conn, conn.id)
+    except Exception as _e:
+        print(f"[conns/create] supabase_rt push skipped: {_e}")
     return conn
 
 
@@ -74,6 +81,7 @@ def create_connection(
 def update_connection(
     conn_id: int,
     data: schemas.ApiConnectionCreate,
+    background: BackgroundTasks,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
@@ -91,12 +99,18 @@ def update_connection(
     db.refresh(conn)
     if conn.bot_id is not None:
         _sync_bot_connections(conn.bot_id, db)
+    try:
+        from .. import supabase_rt as _srt
+        background.add_task(_srt.push_conn, conn.id)
+    except Exception as _e:
+        print(f"[conns/update] supabase_rt push skipped: {_e}")
     return conn
 
 
 @router.delete("/{conn_id}", status_code=204)
 def delete_connection(
     conn_id: int,
+    background: BackgroundTasks,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
@@ -106,9 +120,16 @@ def delete_connection(
             .first())
     if not conn:
         raise HTTPException(404, "Connection not found")
+    cloud_id_for_delete = conn.cloud_id
     bot_id_for_sync = conn.bot_id
     conn.is_active = False
     db.commit()
     # ── Re-sync the bot's folder with the updated (key removed) list ──────────
     if bot_id_for_sync is not None:
         _sync_bot_connections(bot_id_for_sync, db)
+    if cloud_id_for_delete:
+        try:
+            from .. import supabase_rt as _srt
+            background.add_task(_srt.delete_conn_cloud, cloud_id_for_delete)
+        except Exception as _e:
+            print(f"[conns/delete] supabase_rt delete skipped: {_e}")
