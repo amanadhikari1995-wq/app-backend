@@ -704,13 +704,28 @@ class CloudConnector:
     # ── token refresh loop ────────────────────────────────────────────────────
 
     async def _token_refresh_loop(self) -> None:
-        """Background task: proactively refresh Supabase token before expiry."""
+        """Background task: proactively refresh Supabase token before expiry.
+
+        After a successful refresh, close the live WS so the outer reconnect
+        loop reopens it with the fresh JWT. Without this, the relay keeps
+        seeing the old token (its handshake check ran once at connect time)
+        until the next natural disconnect, so logout-from-other-device or
+        token revocation is not honored promptly.
+        """
         while self._running:
             await asyncio.sleep(60)           # check every minute
             if self._auth.needs_refresh():
                 try:
+                    prev = self._auth.access_token
                     await self._auth.ensure_valid_token()
-                    log.info("Token refreshed proactively")
+                    if self._auth.access_token != prev and self._ws is not None:
+                        log.info("Token refreshed - cycling WS to reconnect with fresh token")
+                        try:
+                            await self._ws.close(code=1012, reason="token-refresh")
+                        except Exception:
+                            pass
+                    else:
+                        log.info("Token refreshed proactively")
                 except Exception as e:
                     log.error("Proactive token refresh failed: %s", e)
 
