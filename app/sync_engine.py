@@ -51,7 +51,7 @@ log = logging.getLogger("watchdog.sync")
 SUPABASE_URL      = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
 
-SYNC_INTERVAL_S   = float(os.getenv("WATCHDOG_SYNC_INTERVAL_S", "30.0"))
+SYNC_INTERVAL_S   = float(os.getenv("WATCHDOG_SYNC_INTERVAL_S", "60.0"))
 HTTP_TIMEOUT_S    = 10.0
 
 # Columns we mirror in both directions. Keep in lockstep with sql/cloud-sync.sql
