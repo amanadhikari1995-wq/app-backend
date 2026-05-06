@@ -321,8 +321,38 @@ class CloudAuth:
 
     async def refresh(self) -> str:
         """Use refresh_token (Supabase) to mint a new access_token. Writes
-        the result back to session.json if that's where we read from."""
+        the result back to session.json if that's where we read from.
+
+        Race-safe: before calling Supabase, check whether session.json
+        already has a fresher token written by sync_engine.py (the
+        backend's sync daemon, which also refreshes on a 30s cycle).
+        Supabase rotates the refresh_token on every use; if both
+        processes refresh independently, one gets "refresh_token already
+        used" and its session dies — that's the idle-disconnect bug.
+        Reading session.json first means sync_engine.py is the sole
+        authority for refreshes, and wd_cloud just picks up its work."""
         await self._fetch_supabase_config()
+
+        # ── Check session.json first to avoid racing with sync_engine.py ────
+        if self._cred_source == "session_file" and SESSION_FILE.exists():
+            try:
+                with SESSION_FILE.open("r", encoding="utf-8") as fh:
+                    disk = json.load(fh) or {}
+                disk_token   = disk.get("access_token") or ""
+                disk_expires = int(disk.get("expires_at") or 0)
+                # If session.json has a different non-expired token,
+                # sync_engine.py already refreshed for us — adopt it
+                # rather than calling Supabase (which would rotate the
+                # refresh_token a second time and invalidate sync_engine).
+                if (disk_token and disk_token != self.access_token
+                        and disk_expires > time.time() + 60):
+                    log.info("Adopting fresh token from session.json (sync_engine refreshed it)")
+                    self._load_session_file()
+                    return self.access_token
+            except Exception as exc:
+                log.debug("session.json pre-check failed: %s", exc)
+        # ──────────────────────────────────────────────────────────────────
+
         if not self.refresh_token:
             raise RuntimeError("No refresh_token available to refresh with.")
 
