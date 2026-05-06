@@ -579,10 +579,15 @@ def _run_one_cycle(client: httpx.Client) -> None:
                         .filter(models.Bot.user_id == user.id,
                                 models.Bot.cloud_id.isnot(None))
                         .all())
-        for bot in synced_local:
-            if bot.cloud_id not in cloud_by_id:
-                db.delete(bot)
-                pulls += 1   # count as pull (cloud-side change reflected here)
+        # Safety: if cloud returned 0 bots but we have synced bots locally, this is
+        # almost certainly a transient outage / RLS hiccup. Don't delete user data.
+        if not cloud_by_id and synced_local:
+            log.warning("cloud returned 0 bots but %d local bots have cloud_id — skipping delete propagation (transient?)", len(synced_local))
+        else:
+            for bot in synced_local:
+                if bot.cloud_id not in cloud_by_id:
+                    db.delete(bot)
+                    pulls += 1   # count as pull (cloud-side change reflected here)
 
         # -- api_connections sync (pull+push+delete) --
         cloud_conns = _pull_cloud_conns(client, jwt)
@@ -622,8 +627,13 @@ def _run_one_cycle(client: httpx.Client) -> None:
                     else:
                         row = _push_insert_conn(client, jwt, pl)
                         if row and row.get("id"): c.cloud_id = row["id"]; pushes += 1
-            for c in db.query(models.ApiConnection).filter(models.ApiConnection.user_id == user.id, models.ApiConnection.cloud_id.isnot(None)).all():
-                if c.cloud_id not in conn_by_id: db.delete(c); pulls += 1
+            # Safety: same guard for api_connections — don't delete on empty cloud response.
+            synced_conns = db.query(models.ApiConnection).filter(models.ApiConnection.user_id == user.id, models.ApiConnection.cloud_id.isnot(None)).all()
+            if not conn_by_id and synced_conns:
+                log.warning("cloud returned 0 api_connections but %d local conns have cloud_id — skipping delete propagation (transient?)", len(synced_conns))
+            else:
+                for c in synced_conns:
+                    if c.cloud_id not in conn_by_id: db.delete(c); pulls += 1
 
         db.commit()
 
