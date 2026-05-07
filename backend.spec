@@ -75,13 +75,22 @@ APP_MODULES = [
     # cloud_db is the runtime-only Supabase REST client - imported by
     # routers.bots to fetch bot definitions + api_connections at run-time.
     'app.cloud_db',
+    # error_reporter writes errors to Supabase app_errors. Imported at module
+    # load time in app.main — if missing from the bundle, backend won't start.
+    'app.error_reporter',
 ]
+
+# Belt-and-braces: collect ALL submodules under app/ so we never again ship
+# a backend that's missing a freshly-added module. Performance cost: maybe
+# 200 KB of extra .pyc — irrelevant. The cost of a broken release is hours.
+hiddenimports_extra_app = collect_submodules('app')
 
 # ── Submodules that PyInstaller's static analysis doesn't catch ──────────
 hiddenimports  = []
 hiddenimports += ROUTERS
 hiddenimports += SESSION_MODULES
 hiddenimports += APP_MODULES
+hiddenimports += collect_submodules('app')  # catch-all for any future module
 # Catch any submodules under app.session.detectors that get added later
 hiddenimports += collect_submodules('app.session.detectors')
 hiddenimports += collect_submodules('uvicorn')           # protocols, lifespans
