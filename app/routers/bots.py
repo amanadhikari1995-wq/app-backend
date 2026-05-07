@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from typing import List, Optional
+import logging
 import subprocess
 import sys
 import os
@@ -151,8 +152,13 @@ def _run_once(bot_uuid: str, tmp_path: str, user_id: int, db,
                 db.add(models.BotLog(bot_id=bot_uuid, user_id=user_id,
                                      level=level, message=line))
                 db.commit()
-            except Exception:
-                pass
+            except Exception as _bl_e:
+                # Log it so we can see it (was silent before — hid major bugs)
+                try: db.rollback()
+                except Exception: pass
+                logging.getLogger("watchdog.bot.log").warning(
+                    "BotLog insert failed (bot_id=%s): %s", bot_uuid, _bl_e
+                )
     except Exception as stream_exc:
         err = f"[WATCHDOG] Log stream error for bot {bot_uuid}: {stream_exc}"
         try:
@@ -224,6 +230,11 @@ def _execute(bot_uuid: str, code: str, user_id: int, env: dict,
             db.add(models.BotLog(bot_id=bot_uuid, user_id=user_id,
                                  level=models.LogLevel.ERROR, message=err_msg[:2000]))
             db.commit()
+        except Exception as _le:
+            logging.getLogger("watchdog.bot.exec").warning("err-log insert failed: %s", _le)
+        try:
+            from .. import error_reporter as _er
+            _er.report_error(exc, source="bot-subprocess", bot_id=bot_uuid)
         except Exception:
             pass
         cloud_db.update_bot_status(bot_uuid, status="ERROR", is_running=False)
