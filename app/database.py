@@ -1,30 +1,17 @@
 """
-database.py — SQLite engine with production-grade pragmas.
+database.py - SQLite engine with production-grade pragmas.
 
 Why these settings matter (root cause of the long-running-session lag):
 
-  • WAL (Write-Ahead Log) mode lets readers and writers operate concurrently.
-    Default rollback-journal mode locks the ENTIRE database during every
-    write. Under combined load (bot subprocess writing logs + FastAPI
-    handling polls + frontend dashboard polling every 1.5s), the default
-    config produces "database is locked" errors that hang the whole API.
+  - WAL (Write-Ahead Log) mode lets readers and writers operate concurrently.
+  - busy_timeout=5000 makes SQLite wait up to 5s for a lock instead of erroring.
+  - synchronous=NORMAL fsyncs less aggressively than the default FULL.
+  - cache_size=-20000 = 20 MB of in-memory page cache.
+  - temp_store=MEMORY keeps temporary tables (used by ORDER BY, etc.) in RAM.
 
-  • busy_timeout=5000 makes SQLite wait up to 5s for a lock instead of
-    erroring instantly. Eliminates spurious lock errors under bursty load.
-
-  • synchronous=NORMAL fsyncs less aggressively than the default FULL.
-    Still safe under WAL (no risk of corruption, only the most recent
-    committed transaction can be lost on crash).
-
-  • cache_size=-20000 = 20 MB of in-memory page cache. Default is ~2 MB.
-    Drastically cuts disk reads on hot tables like bot_logs.
-
-  • temp_store=MEMORY keeps temporary tables (used by ORDER BY, etc.) in RAM.
-
-Plus an idx on bot_logs(bot_id, id DESC) — without this, every "fetch
-recent logs for bot N" query scans the full table. After hours of bot
-activity that's the difference between an O(1) index seek and an
-O(N) scan over thousands of rows on every poll.
+Plus an idx on bot_logs(bot_id, id DESC) for the "fetch recent logs for bot N"
+hot path. Bots themselves now live in Supabase; only runtime-buffered tables
+(bot_logs, trades, ai_models, etc.) are owned by this DB.
 """
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.ext.declarative import declarative_base
@@ -37,15 +24,12 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./watchdog.db")
 _IS_SQLITE = "sqlite" in DATABASE_URL
 
-# `timeout=30` — pysqlite's busy-wait when no busy_timeout pragma is set yet.
-# pragmas below override it once the connection is open.
 engine = create_engine(
     DATABASE_URL,
     connect_args={"check_same_thread": False, "timeout": 30} if _IS_SQLITE else {},
 )
 
 
-# Apply pragmas on EVERY new connection (connection pool may rotate them).
 if _IS_SQLITE:
     @event.listens_for(engine, "connect")
     def _set_sqlite_pragmas(dbapi_conn, _connection_record):
@@ -54,7 +38,7 @@ if _IS_SQLITE:
             cur.execute("PRAGMA journal_mode=WAL")
             cur.execute("PRAGMA synchronous=NORMAL")
             cur.execute("PRAGMA busy_timeout=5000")
-            cur.execute("PRAGMA cache_size=-20000")   # negative = KB → 20 MB
+            cur.execute("PRAGMA cache_size=-20000")
             cur.execute("PRAGMA temp_store=MEMORY")
             cur.execute("PRAGMA foreign_keys=ON")
         finally:
@@ -75,17 +59,12 @@ def get_db():
 
 def ensure_columns() -> None:
     """
-    Add columns that may be missing on legacy SQLite databases. Idempotent —
+    Add columns that may be missing on legacy SQLite databases. Idempotent -
     each statement is wrapped in try/except so re-running on a current DB is
     a no-op. Called once at app startup from main.py BEFORE ensure_indexes.
-
-    Currently adds:
-      • users.supabase_uid       — Supabase user UUID, populated on first
-                                    authenticated request via cloud-sync auth
-                                    (step 2 of the bot-data cloud-sync rollout)
     """
     with engine.connect() as conn:
-        # users.supabase_uid (step 2)
+        # users.supabase_uid - populated on first authenticated request
         try:
             conn.execute(text("ALTER TABLE users ADD COLUMN supabase_uid VARCHAR"))
             conn.commit()
@@ -100,91 +79,20 @@ def ensure_columns() -> None:
         except Exception:
             pass
 
-        # bots.cloud_id + bots.cloud_synced_at (step 3) — link the local row
-        # to its mirror in the Supabase `bots` table for cross-device sync.
-        try:
-            conn.execute(text("ALTER TABLE bots ADD COLUMN cloud_id VARCHAR"))
-            conn.commit()
-        except Exception:
-            pass
-        try:
-            conn.execute(text("ALTER TABLE bots ADD COLUMN cloud_synced_at DATETIME"))
-            conn.commit()
-        except Exception:
-            pass
-        try:
-            conn.execute(text(
-                "CREATE INDEX IF NOT EXISTS ix_bots_cloud_id ON bots (cloud_id)"
-            ))
-            conn.commit()
-        except Exception:
-            pass
-
-        # api_connections.cloud_id — Supabase UUID link for write-through sync
-        try:
-            conn.execute(text("ALTER TABLE api_connections ADD COLUMN cloud_id VARCHAR"))
-            conn.commit()
-        except Exception:
-            pass
-        try:
-            conn.execute(text(
-                "CREATE INDEX IF NOT EXISTS ix_api_connections_cloud_id "
-                "ON api_connections (cloud_id)"
-            ))
-            conn.commit()
-        except Exception:
-            pass
-
-
-def ensure_bot_folders() -> None:
-    """
-    Make sure every bot in the DB has its on-disk folder. Bots that pre-date
-    bot_manager (or whose folders were deleted out from under them) get their
-    folders rebuilt from the DB row. Idempotent — silently skips bots whose
-    folder already exists.
-
-    Called at startup AFTER ensure_columns + ensure_indexes so the schema is
-    settled before we touch any rows.
-    """
-    from .bot_manager import BotFS
-    from . import models
-    db = SessionLocal()
-    rebuilt = 0
-    try:
-        for bot in db.query(models.Bot).all():
-            try:
-                bfs = BotFS(bot.id, bot.name or f"bot-{bot.id}")
-                if bfs.exists():
-                    continue
-                bfs.create(
-                    code        = bot.code or "",
-                    description = bot.description or "",
-                )
-                rebuilt += 1
-            except Exception as e:
-                # One bot's folder failure must not abort the rest.
-                print(f"[ensure_bot_folders] bot id={bot.id} failed: {e}")
-        if rebuilt:
-            print(f"[ensure_bot_folders] rebuilt {rebuilt} missing bot folder(s)")
-    finally:
-        db.close()
-
 
 def ensure_indexes() -> None:
     """
-    Create performance-critical indexes that aren't on the ORM models.
-    Idempotent — `IF NOT EXISTS` makes repeated calls a no-op.
-    Called once at app startup from main.py.
+    Create performance-critical indexes for runtime-buffered tables.
+    Idempotent. bot_id is now a TEXT column (Supabase UUID); the existing
+    index name is preserved so older DBs benefit immediately.
     """
     if not _IS_SQLITE:
         return
     with engine.connect() as conn:
-        # bot_logs: hot path — every poll fetches "last N logs for bot X"
         conn.execute(text(
             "CREATE INDEX IF NOT EXISTS ix_bot_logs_bot_id_id "
             "ON bot_logs (bot_id, id DESC)"
         ))
-        # trades: similar hot path for trade history per bot
         conn.execute(text(
             "CREATE INDEX IF NOT EXISTS ix_trades_bot_id_created "
             "ON trades (bot_id, created_at DESC)"
