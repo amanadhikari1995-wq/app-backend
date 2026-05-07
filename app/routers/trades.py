@@ -5,6 +5,7 @@ from typing import List
 from ..database import get_db
 from .. import models, schemas
 from ..auth import get_default_user as get_current_user
+from .bots import get_bot_uuid_for_secret
 
 router = APIRouter(prefix="/api/trades", tags=["trades"])
 
@@ -15,19 +16,21 @@ def record_trade(
     data: schemas.TradeCreate,
     x_bot_secret: str = Header(..., alias="X-Bot-Secret"),
     db: Session = Depends(get_db),
+    user=Depends(get_current_user),
 ):
-    """Called from within bot code to record a trade. Authenticated via the bot's secret token."""
-    bot = db.query(models.Bot).filter(models.Bot.bot_secret == x_bot_secret).first()
-    if not bot:
+    """Called from within bot code to record a trade. Authenticated via the
+    bot's secret token, which is generated per-run and held in memory by
+    the bots router (no DB lookup)."""
+    bot_uuid = get_bot_uuid_for_secret(x_bot_secret)
+    if not bot_uuid:
         raise HTTPException(401, "Invalid bot secret")
-    trade = models.Trade(bot_id=bot.id, user_id=bot.user_id, **data.model_dump())
+    trade = models.Trade(bot_id=bot_uuid, user_id=user.id, **data.model_dump())
     db.add(trade)
     db.commit()
     db.refresh(trade)
-    # ── Notify AI Lab so live-sync models receive the trade ───────────────────
     try:
         from .ai_models import notify_trade as _notify_trade
-        _notify_trade(bot.id, data.model_dump())
+        _notify_trade(bot_uuid, data.model_dump())
     except Exception:
         pass
     return trade
@@ -36,14 +39,11 @@ def record_trade(
 # ── User-authenticated endpoints (called from frontend) ───────────────────────
 @router.get("/", response_model=List[schemas.TradeOut])
 def list_trades(
-    bot_id: int,
+    bot_id: str,
     limit: int = 500,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
-    bot = db.query(models.Bot).filter(models.Bot.id == bot_id, models.Bot.user_id == user.id).first()
-    if not bot:
-        raise HTTPException(404, "Bot not found")
     return (db.query(models.Trade)
             .filter(models.Trade.bot_id == bot_id)
             .order_by(models.Trade.created_at.desc())
@@ -53,14 +53,10 @@ def list_trades(
 
 @router.get("/stats", response_model=schemas.TradeStats)
 def trade_stats(
-    bot_id: int,
+    bot_id: str,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
-    bot = db.query(models.Bot).filter(models.Bot.id == bot_id, models.Bot.user_id == user.id).first()
-    if not bot:
-        raise HTTPException(404, "Bot not found")
-
     trades    = db.query(models.Trade).filter(models.Trade.bot_id == bot_id).all()
     pnl_list  = [t for t in trades if t.pnl is not None]
     winning   = [t for t in pnl_list if t.pnl > 0]
@@ -84,13 +80,10 @@ def trade_stats(
 
 @router.delete("/bot/{bot_id}", status_code=204)
 def clear_bot_trades(
-    bot_id: int,
+    bot_id: str,
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
-    bot = db.query(models.Bot).filter(models.Bot.id == bot_id, models.Bot.user_id == user.id).first()
-    if not bot:
-        raise HTTPException(404, "Bot not found")
     db.query(models.Trade).filter(models.Trade.bot_id == bot_id).delete()
     db.commit()
 
@@ -101,10 +94,8 @@ def delete_trade(
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
-    trade = (db.query(models.Trade)
-             .join(models.Bot)
-             .filter(models.Trade.id == trade_id, models.Bot.user_id == user.id)
-             .first())
+    trade = db.query(models.Trade).filter(models.Trade.id == trade_id,
+                                          models.Trade.user_id == user.id).first()
     if not trade:
         raise HTTPException(404, "Trade not found")
     db.delete(trade)
