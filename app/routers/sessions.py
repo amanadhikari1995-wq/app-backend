@@ -71,24 +71,29 @@ def _on_session_event(ev: SessionEvent) -> None:
     log.info(line)              # always log to backend stdout
 
     # Mirror into bot_logs so the Dashboard's existing log-pollers pick it up.
+    # Bot definitions live in Supabase, so we discover currently-running bots
+    # via the in-memory process table held by the bots router.
     try:
         from ..database import SessionLocal
         from .. import models
-        db = SessionLocal()
-        try:
-            running_bots = (db.query(models.Bot)
-                              .filter(models.Bot.status == models.BotStatus.RUNNING)
-                              .all())
-            for bot in running_bots:
-                db.add(models.BotLog(
-                    bot_id=bot.id,
-                    user_id=bot.user_id,
-                    level=models.LogLevel.INFO,
-                    message=line,
-                ))
-            db.commit()
-        finally:
-            db.close()
+        from .bots import _processes as _bot_processes
+        running_uuids = list(_bot_processes.keys())
+        if running_uuids:
+            db = SessionLocal()
+            try:
+                # user_id is fixed: this is a single-user desktop app.
+                user = db.query(models.User).filter(models.User.id == 1).first()
+                user_id = user.id if user else 1
+                for bot_uuid in running_uuids:
+                    db.add(models.BotLog(
+                        bot_id=bot_uuid,
+                        user_id=user_id,
+                        level=models.LogLevel.INFO,
+                        message=line,
+                    ))
+                db.commit()
+            finally:
+                db.close()
     except Exception:
         # Never let a logging failure crash the session manager.
         log.exception("failed to mirror session event into bot_logs")
