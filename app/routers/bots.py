@@ -207,7 +207,14 @@ def _execute(bot_uuid: str, code: str, user_id: int, env: dict,
             final = "IDLE"
         else:
             final = "ERROR"
-        cloud_db.update_bot_status(bot_uuid, status=final, is_running=False)
+        # Fetch current run_count + increment (cloud is source of truth)
+        try:
+            current = cloud_db.get_bot(bot_uuid) or {}
+            new_run_count = int(current.get("run_count") or 0) + 1
+        except Exception:
+            new_run_count = None
+        cloud_db.update_bot_status(bot_uuid, status=final, is_running=False,
+                                   run_count=new_run_count)
 
     except Exception as exc:
         import traceback as _tb
