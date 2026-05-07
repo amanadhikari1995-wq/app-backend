@@ -79,6 +79,24 @@ def ensure_columns() -> None:
         except Exception:
             pass
 
+        # Legacy data fix: bot_id columns on bot_logs + trades used to be
+        # INTEGER (FK to local bots.id). After the v3.6.0 refactor they're
+        # TEXT (Supabase UUID). SQLite is type-permissive so the column type
+        # stays whatever it was at table creation, but the row VALUES still
+        # come back as int. Pydantic str-typed BotLogOut/TradeOut then 500s
+        # the dashboard endpoint with a validation error, which the frontend
+        # surfaces as "Local backend unreachable".
+        # CAST every existing int bot_id to TEXT so reads come back as str.
+        for tbl in ("bot_logs", "trades"):
+            try:
+                conn.execute(text(
+                    f"UPDATE {tbl} SET bot_id = CAST(bot_id AS TEXT) "
+                    f"WHERE bot_id IS NOT NULL AND typeof(bot_id) = 'integer'"
+                ))
+                conn.commit()
+            except Exception:
+                pass
+
 
 def ensure_indexes() -> None:
     """
