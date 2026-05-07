@@ -290,7 +290,7 @@ def main() -> None:
             host=host,
             port=port,
             log_level="info",
-            access_log=True,  // diagnostic: show HTTP requests in backend.log
+            access_log=True,  # diagnostic: show HTTP requests in backend.log
             reload=False,           # MUST be False inside a frozen exe
             workers=1,
         )
