@@ -400,8 +400,8 @@ def _run_training_job(model_id: int, user_id: int):
         bots_used = []
 
         for bot_id in (model.connected_bot_ids or []):
-            bot = db.query(models.Bot).filter(models.Bot.id == bot_id).first()
-            bot_name = bot.name if bot else f"Bot #{bot_id}"
+            # Bot definitions live in Supabase; we only know the UUID here.
+            bot_name = f"Bot #{bot_id}"
             safe_name = re.sub(r'[^a-z0-9_]', '_', bot_name.lower())
 
             folder = TRAINING_DIR / f"bot_{bot_id}_{safe_name}"
