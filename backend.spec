@@ -32,7 +32,6 @@ from PyInstaller.utils.hooks import (
 # ── Routers (imported by string in app.main) ─────────────────────────────
 ROUTERS = [
     'app.routers.bots',
-    'app.routers.api_connections',
     'app.routers.dashboard',
     'app.routers.trades',
     'app.routers.trainer',
@@ -73,18 +72,9 @@ APP_MODULES = [
     'app.database',
     'app.models',
     'app.schemas',
-    # cloud_client is imported at top of routers.bots so static analysis
-    # picks it up — but list explicitly so a refactor that moves the
-    # import inside a function doesn't silently lose it from the bundle.
-    'app.cloud_client',
-    # sync_engine is imported lazily inside main.py's lifespan handler.
-    # PyInstaller's static analyser does NOT see lazy/in-function imports,
-    # so this MUST be explicit or sync_engine.py won't be in the exe and
-    # cloud-sync silently degrades to local-only at every startup.
-    'app.sync_engine',
-    # supabase_rt is imported lazily inside router functions (from .. import supabase_rt).
-    # Must be explicit for the same reason as sync_engine above.
-    'app.supabase_rt',
+    # cloud_db is the runtime-only Supabase REST client - imported by
+    # routers.bots to fetch bot definitions + api_connections at run-time.
+    'app.cloud_db',
 ]
 
 # ── Submodules that PyInstaller's static analysis doesn't catch ──────────
