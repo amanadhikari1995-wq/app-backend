@@ -213,11 +213,8 @@ def get_folder_structure(bot_id: int):
 @router.get("/overview")
 def get_overview(db: Session = Depends(get_db)):
     """Master stats across ALL bots — for the dashboard header cards."""
-    # Only show bots that still exist in the database (filter out deleted bots)
-    try:
-        valid_bot_ids = {row[0] for row in db.query(models.Bot.id).all()}
-    except Exception:
-        valid_bot_ids = None  # DB unavailable — fall back to showing all folders
+    # Bots live in Supabase; we don't filter by existence here.
+    valid_bot_ids = None
 
     folders = _bot_folders()
     if valid_bot_ids is not None:
