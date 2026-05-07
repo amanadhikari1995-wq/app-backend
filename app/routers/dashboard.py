@@ -5,28 +5,34 @@ from typing import List
 from ..database import get_db
 from .. import models, schemas
 from ..auth import get_default_user as get_current_user
+from ..routers.bots import _processes as _bot_processes
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
 
 @router.get("/stats", response_model=schemas.DashboardStats)
 def get_stats(db: Session = Depends(get_db), user=Depends(get_current_user)):
-    bots = db.query(models.Bot).filter(models.Bot.user_id == user.id).all()
-    bot_ids = [b.id for b in bots]
-    total_trades = 0
-    if bot_ids:
-        total_trades = db.query(models.Trade).filter(models.Trade.bot_id.in_(bot_ids)).count()
+    """
+    Stats for the desktop dashboard. Bots themselves live in Supabase, so
+    `total_bots` and `total_runs` are reported by the website (closer to the
+    source of truth). The backend reports only what it owns:
+      - running_bots: live process count in this backend
+      - total_trades: rows in the local trades buffer
+      - recent_logs:  latest log lines from bot_logs
+    """
+    running_bots = len(_bot_processes)
+    total_trades = db.query(models.Trade).filter(models.Trade.user_id == user.id).count()
     recent_logs = (db.query(models.BotLog)
                    .filter(models.BotLog.user_id == user.id)
                    .order_by(models.BotLog.created_at.desc())
                    .limit(200)
                    .all())
     return {
-        "total_bots": len(bots),
-        "running_bots": sum(1 for b in bots if b.status == models.BotStatus.RUNNING),
-        "total_runs": sum(b.run_count or 0 for b in bots),
+        "total_bots":   0,             # Supabase is source of truth
+        "running_bots": running_bots,
+        "total_runs":   0,             # Supabase is source of truth
         "total_trades": total_trades,
-        "recent_logs": recent_logs,
+        "recent_logs":  recent_logs,
     }
 
 
@@ -40,8 +46,8 @@ def get_recent_logs(
     """
     Lightweight log-streaming endpoint used by the global Logs page.
 
-    since_id=0  → return the latest `limit` logs (desc), for initial page load.
-    since_id>0  → return only logs with id > since_id in asc order (new lines only).
+    since_id=0  -> return the latest `limit` logs (desc), for initial page load.
+    since_id>0  -> return only logs with id > since_id in asc order (new lines only).
     """
     q = db.query(models.BotLog).filter(models.BotLog.user_id == user.id)
     if since_id > 0:
