@@ -48,8 +48,32 @@ def _run_migrations():
                 pass
 
 
+def _drop_legacy_tables_with_wrong_bot_id_type():
+    """v3.5.x stored bot_id as INTEGER FK to local bots.id. v3.6.0 made it
+    a Supabase UUID string. SQLite never alters column types on its own,
+    so existing tables keep the wrong INTEGER type and silently reject
+    new UUID-string inserts (or store them garbled). Detect and drop the
+    legacy tables here so Base.metadata.create_all recreates them with
+    the correct String schema. The data we lose is rolling buffer (logs)
+    or local-only analytics (trades) — re-creatable at next bot run."""
+    from sqlalchemy import text
+    try:
+        with engine.connect() as conn:
+            for tbl in ("bot_logs", "trades"):
+                row = conn.execute(text(
+                    f"SELECT type FROM pragma_table_info('{tbl}') WHERE name='bot_id'"
+                )).fetchone()
+                if row and row[0] and 'INT' in row[0].upper():
+                    print(f"[watchdog] Detected legacy INTEGER bot_id in {tbl} - dropping (recreated with TEXT schema)")
+                    conn.execute(text(f"DROP TABLE {tbl}"))
+                    conn.commit()
+    except Exception as e:
+        print(f"[watchdog] legacy table drop check failed: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _drop_legacy_tables_with_wrong_bot_id_type()
     Base.metadata.create_all(bind=engine)
     _run_migrations()
     from .database import ensure_columns, ensure_indexes
