@@ -115,9 +115,15 @@ app = FastAPI(
 # ── Auto error reporting to Supabase app_errors table ───────────────────────
 # Every unhandled exception in a request handler gets logged AND written to
 # the central Supabase table for admin visibility.
+#
+# IMPORTANT: All imports here are LAZY (inside the handler body). If the
+# error_reporter module is somehow missing from the PyInstaller bundle, we
+# log a warning and degrade gracefully — backend STILL STARTS. Eagerly
+# importing here at module load was previously a silent killswitch:
+# ModuleNotFoundError → main.py fails to import → backend exits → frontend
+# shows "Local backend unreachable" with no clue why.
 from fastapi import Request
 from fastapi.responses import JSONResponse
-from .error_reporter import report_error as _report_error
 import logging as _logging
 _log = _logging.getLogger("watchdog.exception")
 
@@ -125,6 +131,7 @@ _log = _logging.getLogger("watchdog.exception")
 async def _global_exception_handler(request: Request, exc: Exception):
     _log.exception("Unhandled exception in %s %s", request.method, request.url.path)
     try:
+        from .error_reporter import report_error as _report_error  # lazy
         _report_error(
             exc,
             source="backend",
@@ -134,8 +141,8 @@ async def _global_exception_handler(request: Request, exc: Exception):
                 "query":  str(request.url.query)[:500],
             },
         )
-    except Exception:
-        pass  # never let reporting break the response
+    except Exception as _re:
+        _log.warning("Error reporter unavailable (degraded gracefully): %s", _re)
     return JSONResponse(status_code=500, content={
         "detail": "Internal server error",
         "type":   type(exc).__name__,
