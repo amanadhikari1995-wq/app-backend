@@ -107,7 +107,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="WATCH-DOG Universal Bot Platform",
     description="Run any type of bot with your own Python code",
-    version="3.6.5",
+    version="3.6.6",
     lifespan=lifespan,
 )
 
@@ -181,5 +181,11 @@ def root():
 
 
 @app.get("/health")
+@app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    """ROOT CAUSE FIX: Electron supervisor (backend-runner.js) probes
+    /api/health to decide if backend is alive. Without /api prefix it
+    got 404 every probe -> supervisor killed+respawned backend every
+    minute -> frontend permanently showed "Local backend unreachable".
+    Both routes are accepted (no client breakage)."""
+    return {"status": "ok", "version": "3.6.6"}
