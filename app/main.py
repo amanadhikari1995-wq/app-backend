@@ -107,9 +107,39 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="WATCH-DOG Universal Bot Platform",
     description="Run any type of bot with your own Python code",
-    version="3.6.0",
+    version="3.6.5",
     lifespan=lifespan,
 )
+
+
+# ── Auto error reporting to Supabase app_errors table ───────────────────────
+# Every unhandled exception in a request handler gets logged AND written to
+# the central Supabase table for admin visibility.
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from .error_reporter import report_error as _report_error
+import logging as _logging
+_log = _logging.getLogger("watchdog.exception")
+
+@app.exception_handler(Exception)
+async def _global_exception_handler(request: Request, exc: Exception):
+    _log.exception("Unhandled exception in %s %s", request.method, request.url.path)
+    try:
+        _report_error(
+            exc,
+            source="backend",
+            context={
+                "method": request.method,
+                "path":   str(request.url.path),
+                "query":  str(request.url.query)[:500],
+            },
+        )
+    except Exception:
+        pass  # never let reporting break the response
+    return JSONResponse(status_code=500, content={
+        "detail": "Internal server error",
+        "type":   type(exc).__name__,
+    })
 
 # CORS - localhost-only API; accept any origin for desktop / dev / packaged builds.
 app.add_middleware(
