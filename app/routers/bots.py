@@ -57,6 +57,46 @@ def _env_prefix(name: str) -> str:
     return re.sub(r'[^A-Z0-9]+', '_', (name or "").upper()).strip('_')
 
 
+def _bot_runtime_dir(bot_uuid: str) -> str:
+    """Per-bot working directory (CWD for the subprocess)."""
+    base = os.environ.get("WATCHDOG_DATA_DIR")
+    if not base:
+        if os.name == "nt":
+            base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+            base = os.path.join(base, "WatchDog")
+        else:
+            base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+            base = os.path.join(base, "WatchDog")
+    p = os.path.join(base, "bot-runtime", bot_uuid)
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
+def _materialize_secrets_to_disk(runtime_dir: str, conns: list, env: dict) -> None:
+    """Write PEM-style secrets as files in the bot's runtime dir.
+    Bots that read e.g. open('kalshi_private_key.pem') then work without
+    code change. We write multiple filename variants to cover common
+    conventions used by trading-bot tutorials and SDKs.
+    """
+    for c in (conns or []):
+        secret = (c.get("api_secret") or "")
+        if not secret or "BEGIN" not in secret[:50]:
+            continue
+        raw_name = (c.get("name") or "")
+        sanitized = re.sub(r'[^a-z0-9]+', '_', raw_name.lower()).strip('_') or "connection"
+        first_word = sanitized.split('_')[0] or sanitized
+        candidates = [f"{first_word}_private_key.pem"]
+        if sanitized != first_word:
+            candidates.append(f"{sanitized}_private_key.pem")
+        for fname in candidates:
+            try:
+                fpath = os.path.join(runtime_dir, fname)
+                with open(fpath, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(secret)
+                env[f"{first_word.upper()}_PRIVATE_KEY_FILE"] = fpath
+            except Exception:
+                pass
+
 def _build_env(bot_uuid: str, bot_row: dict, conns: list[dict], bot_secret: str) -> dict:
     """Build environment for the bot subprocess from cloud-fetched data."""
     env = os.environ.copy()
@@ -103,7 +143,8 @@ def _build_env(bot_uuid: str, bot_row: dict, conns: list[dict], bot_secret: str)
 
 def _run_once(bot_uuid: str, tmp_path: str, user_id: int, db,
               env: dict, demo_mode: bool = False,
-              python_exe: Optional[str] = None) -> int:
+              python_exe: Optional[str] = None,
+              cwd: Optional[str] = None) -> int:
     """Run the bot script once, stream logs to SQLite, return exit code.
 
     If python_exe is provided (set when the bot has requirements + a venv),
@@ -138,6 +179,7 @@ def _run_once(bot_uuid: str, tmp_path: str, user_id: int, db,
             errors='replace',
             bufsize=1,
             env=env,
+            cwd=cwd,
             **_popen_kwargs,
         )
     except Exception as exc:
@@ -195,10 +237,12 @@ def _run_once(bot_uuid: str, tmp_path: str, user_id: int, db,
 
 def _execute(bot_uuid: str, code: str, user_id: int, env: dict,
              bot_secret: str, demo_mode: bool = False,
-             python_exe: Optional[str] = None, requirements: Optional[str] = None):
+             python_exe: Optional[str] = None, requirements: Optional[str] = None,
+             conns_for_bot: Optional[list] = None):
     """Background-thread entry point: write code to a temp file, run, log status."""
     db = SessionLocal()
     tmp_path = None
+    if conns_for_bot is None: conns_for_bot = []
     try:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as f:
             f.write(code)
@@ -244,8 +288,14 @@ def _execute(bot_uuid: str, code: str, user_id: int, env: dict,
                 python_exe = str(py_path) if py_path else None
             # else: code uses only stdlib/bundled libs -> bundled python is fine
 
+        # Phase 2: write PEM secrets as files + set CWD so bot code that does
+        # open("kalshi_private_key.pem") works without modification.
+        runtime_dir = _bot_runtime_dir(bot_uuid)
+        _materialize_secrets_to_disk(runtime_dir, conns_for_bot, env)
+
         rc = _run_once(bot_uuid, tmp_path, user_id, db, env,
-                       demo_mode=demo_mode, python_exe=python_exe)
+                       demo_mode=demo_mode, python_exe=python_exe,
+                       cwd=runtime_dir)
 
         exit_msg = f"[WATCHDOG] Process exited with code {rc}"
         exit_level = models.LogLevel.INFO if rc == 0 else models.LogLevel.ERROR
@@ -326,7 +376,7 @@ def run_bot(
 
     threading.Thread(
         target=_execute,
-        args=(bot_id, code, user.id, env, bot_secret, body.demo_mode, None, requirements),
+        args=(bot_id, code, user.id, env, bot_secret, body.demo_mode, None, requirements, conns),
         daemon=True,
     ).start()
     return {"message": "Bot started", "bot_id": bot_id, "demo_mode": body.demo_mode}
