@@ -212,10 +212,13 @@ def _execute(bot_uuid: str, code: str, user_id: int, env: dict,
             last_run_at=datetime.now(timezone.utc).isoformat(),
         )
 
-        # Phase 2: if bot declared requirements, prepare per-bot venv via uv.
-        # We do this AFTER PATCH-RUNNING (status=RUNNING) so users see progress.
-        if requirements and not python_exe:
+        # Phase 2: per-bot venv lifecycle.
+        #   - Explicit requirements field set -> install exactly those.
+        #   - Empty requirements -> AST-scan the code, auto-detect imports,
+        #     install whatever's not stdlib/bundled. (Zero-config UX.)
+        if not python_exe:
             from .. import bot_venv as _bv
+
             def _setup_log(line: str) -> None:
                 try:
                     db.add(models.BotLog(bot_id=bot_uuid, user_id=user_id,
@@ -224,12 +227,22 @@ def _execute(bot_uuid: str, code: str, user_id: int, env: dict,
                 except Exception:
                     try: db.rollback()
                     except Exception: pass
-            py_path, err = _bv.prepare_venv(bot_uuid, requirements, log_callback=_setup_log)
-            if err:
-                _setup_log(f"[setup] FAILED: {err}")
-                cloud_db.update_bot_status(bot_uuid, status="ERROR", is_running=False)
-                return
-            python_exe = str(py_path) if py_path else None
+
+            effective_reqs = (requirements or "").strip()
+            if not effective_reqs:
+                detected = _bv.detect_requirements_from_code(code)
+                if detected:
+                    effective_reqs = "\n".join(detected)
+                    _setup_log(f"[setup] auto-detected dependencies: {', '.join(detected)}")
+
+            if effective_reqs:
+                py_path, err = _bv.prepare_venv(bot_uuid, effective_reqs, log_callback=_setup_log)
+                if err:
+                    _setup_log(f"[setup] FAILED: {err}")
+                    cloud_db.update_bot_status(bot_uuid, status="ERROR", is_running=False)
+                    return
+                python_exe = str(py_path) if py_path else None
+            # else: code uses only stdlib/bundled libs -> bundled python is fine
 
         rc = _run_once(bot_uuid, tmp_path, user_id, db, env,
                        demo_mode=demo_mode, python_exe=python_exe)
