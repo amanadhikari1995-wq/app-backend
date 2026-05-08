@@ -102,8 +102,16 @@ def _build_env(bot_uuid: str, bot_row: dict, conns: list[dict], bot_secret: str)
 
 
 def _run_once(bot_uuid: str, tmp_path: str, user_id: int, db,
-              env: dict, demo_mode: bool = False) -> int:
-    """Run the bot script once, stream logs to SQLite, return exit code."""
+              env: dict, demo_mode: bool = False,
+              python_exe: Optional[str] = None) -> int:
+    """Run the bot script once, stream logs to SQLite, return exit code.
+
+    If python_exe is provided (set when the bot has requirements + a venv),
+    we use it instead of sys.executable. The venv path runs the bot script
+    directly (no wd_runner wrapper) — wd_runner is only needed in the
+    bundled-PyInstaller case to switch the frozen exe into "run a script"
+    mode. A real venv python.exe just runs the script natively.
+    """
     _popen_kwargs: dict = {}
     if sys.platform == "win32":
         _popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -111,9 +119,18 @@ def _run_once(bot_uuid: str, tmp_path: str, user_id: int, db,
     env["DRY_RUN"] = "1" if demo_mode else "0"
 
     try:
-        _wd_runner = os.path.join(_SDK_DIR, 'wd_runner.py')
+        if python_exe:
+            # Real venv python: run the bot script directly. Auto-log hooks
+            # would require wd_autolog to be installed in the venv too — defer
+            # for now; bots use plain print() which is fine.
+            cmd = [python_exe, '-u', tmp_path]
+        else:
+            # Bundled PyInstaller path: re-invoke this exe via wd_runner.py
+            # (run_backend.py detects script arg and switches to runpy mode).
+            _wd_runner = os.path.join(_SDK_DIR, 'wd_runner.py')
+            cmd = [sys.executable, '-u', _wd_runner, tmp_path]
         process = subprocess.Popen(
-            [sys.executable, '-u', _wd_runner, tmp_path],
+            cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -177,7 +194,8 @@ def _run_once(bot_uuid: str, tmp_path: str, user_id: int, db,
 
 
 def _execute(bot_uuid: str, code: str, user_id: int, env: dict,
-             bot_secret: str, demo_mode: bool = False):
+             bot_secret: str, demo_mode: bool = False,
+             python_exe: Optional[str] = None, requirements: Optional[str] = None):
     """Background-thread entry point: write code to a temp file, run, log status."""
     db = SessionLocal()
     tmp_path = None
@@ -194,7 +212,27 @@ def _execute(bot_uuid: str, code: str, user_id: int, env: dict,
             last_run_at=datetime.now(timezone.utc).isoformat(),
         )
 
-        rc = _run_once(bot_uuid, tmp_path, user_id, db, env, demo_mode=demo_mode)
+        # Phase 2: if bot declared requirements, prepare per-bot venv via uv.
+        # We do this AFTER PATCH-RUNNING (status=RUNNING) so users see progress.
+        if requirements and not python_exe:
+            from .. import bot_venv as _bv
+            def _setup_log(line: str) -> None:
+                try:
+                    db.add(models.BotLog(bot_id=bot_uuid, user_id=user_id,
+                                         level=models.LogLevel.INFO, message=line))
+                    db.commit()
+                except Exception:
+                    try: db.rollback()
+                    except Exception: pass
+            py_path, err = _bv.prepare_venv(bot_uuid, requirements, log_callback=_setup_log)
+            if err:
+                _setup_log(f"[setup] FAILED: {err}")
+                cloud_db.update_bot_status(bot_uuid, status="ERROR", is_running=False)
+                return
+            python_exe = str(py_path) if py_path else None
+
+        rc = _run_once(bot_uuid, tmp_path, user_id, db, env,
+                       demo_mode=demo_mode, python_exe=python_exe)
 
         exit_msg = f"[WATCHDOG] Process exited with code {rc}"
         exit_level = models.LogLevel.INFO if rc == 0 else models.LogLevel.ERROR
@@ -271,10 +309,11 @@ def run_bot(
     _running_secrets[bot_secret] = bot_id
 
     env = _build_env(bot_id, bot, conns, bot_secret)
+    requirements = bot.get("requirements") or ""
 
     threading.Thread(
         target=_execute,
-        args=(bot_id, code, user.id, env, bot_secret, body.demo_mode),
+        args=(bot_id, code, user.id, env, bot_secret, body.demo_mode, None, requirements),
         daemon=True,
     ).start()
     return {"message": "Bot started", "bot_id": bot_id, "demo_mode": body.demo_mode}
