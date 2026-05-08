@@ -83,6 +83,86 @@ def _find_uv() -> Optional[Path]:
     return None
 
 
+# Mapping for the cases where the import name in code differs from the
+# PyPI install name. Most packages ARE the same — we only list the
+# differences here. Falls back to "install name == import name".
+# Add common trading / data libs that don't follow the standard naming.
+_IMPORT_TO_PYPI: dict[str, str] = {
+    "cv2": "opencv-python",
+    "bs4": "beautifulsoup4",
+    "PIL": "pillow",
+    "yaml": "pyyaml",
+    "sklearn": "scikit-learn",
+    "skimage": "scikit-image",
+    "binance": "python-binance",
+    "discord": "discord.py",
+    "telegram": "python-telegram-bot",
+    "dotenv": "python-dotenv",
+    "pandas_ta": "pandas-ta",
+    "kalshi_python": "kalshi-python",
+    "kalshi_python_sync": "kalshi-python-sync",
+    "alpaca": "alpaca-py",
+}
+
+# Imports already provided by the bundled PyInstaller backend exe — no need
+# to install these. If the bot ONLY uses these (plus stdlib), we skip the
+# whole venv and run on bundled Python (fast path).
+_BUNDLED: set[str] = {
+    "httpx", "websockets", "ccxt", "cryptography", "requests", "urllib3",
+    "anyio", "starlette", "fastapi", "uvicorn", "sqlalchemy", "pydantic",
+    "jose", "passlib", "psutil", "apscheduler", "dotenv", "json", "asyncio",
+    "langchain", "langchain_core", "langchain_community", "langchain_anthropic",
+    "langgraph",
+}
+
+
+def _stdlib_modules() -> set:
+    """Modules that ship with Python (no install needed). 3.10+ has
+    sys.stdlib_module_names as the source of truth."""
+    return set(getattr(sys, "stdlib_module_names", set()))
+
+
+def detect_requirements_from_code(code: str) -> list[str]:
+    """Parse bot code → return list of pip-install names that need a venv.
+
+    Strategy: AST-walk the code, collect top-level imports, drop stdlib +
+    already-bundled libs, map to PyPI names where they differ.
+
+    Returns empty list if everything's stdlib/bundled (caller can skip venv).
+    """
+    if not code:
+        return []
+    import ast
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        # Bot code with a syntax error — let it run via bundled python and fail
+        # there (the user wants to SEE the error, not have setup fail).
+        return []
+
+    seen: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                if top: seen.add(top)
+        elif isinstance(node, ast.ImportFrom):
+            # Skip relative imports (level > 0) — those are within the script
+            if node.module and node.level == 0:
+                top = node.module.split(".")[0]
+                if top: seen.add(top)
+
+    stdlib = _stdlib_modules()
+    needs_install: list[str] = []
+    for mod in seen:
+        if mod in stdlib:    continue
+        if mod in _BUNDLED:  continue
+        if mod.startswith("_"):  continue
+        # Map to PyPI name; if not in map, assume PyPI name == import name
+        pypi = _IMPORT_TO_PYPI.get(mod, mod)
+        needs_install.append(pypi)
+    return sorted(set(needs_install))
+
 def hash_requirements(requirements: str) -> str:
     """Stable hash of normalised requirements text. Whitespace + comments
     don't trigger a reinstall."""
