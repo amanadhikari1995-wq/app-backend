@@ -107,7 +107,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="WATCH-DOG Universal Bot Platform",
     description="Run any type of bot with your own Python code",
-    version="3.6.6",
+    version="1.0.0",
     lifespan=lifespan,
 )
 
@@ -177,7 +177,7 @@ app.include_router(sessions.router)
 
 @app.get("/")
 def root():
-    return {"status": "WATCH-DOG Universal Bot Platform running", "version": "3.6.0"}
+    return {"status": "WATCH-DOG Universal Bot Platform running", "version": "1.0.0"}
 
 
 @app.get("/health")
@@ -188,4 +188,4 @@ def health():
     got 404 every probe -> supervisor killed+respawned backend every
     minute -> frontend permanently showed "Local backend unreachable".
     Both routes are accepted (no client breakage)."""
-    return {"status": "ok", "version": "3.6.6"}
+    return {"status": "ok", "version": "1.0.0"}
