@@ -125,9 +125,15 @@ def _post_batch(batch: list[dict]) -> None:
         # Drop the batch — local SQLite has the rows; renderer cant subscribe
         # without auth anyway.
         return
+    # ── v1.1.1 bug-fix ────────────────────────────────────────────────────
+    # _auth() returns the tuple (jwt, user_id); _headers() expects only the
+    # jwt string. v1.1.0 passed the whole tuple, producing the malformed
+    # header `Authorization: Bearer ('jwt', 'uid')` → Supabase rejected every
+    # POST → bot_logs_tail stayed empty. Unpack here.
+    jwt_str, _uid = auth
     try:
         url = f"{SUPABASE_URL}{_ENDPOINT}"
-        hdrs = _headers(auth)
+        hdrs = _headers(jwt_str)
         # ignore-duplicates: if the same (bot_id, local_log_id) row was
         # already inserted (e.g. queue shipped it once, retry shipped again
         # before the dedup index removed it), the second attempt is a no-op
