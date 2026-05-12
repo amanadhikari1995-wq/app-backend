@@ -27,6 +27,19 @@ from datetime import datetime, timezone
 
 from ..database import get_db, SessionLocal
 from .. import models, schemas, cloud_db
+from ..cloud_log_shipper import ship_log as _cloud_ship_log
+
+# ── Cloud log shipping helper (v1.1.0) ───────────────────────────────────────
+# Each SQLite log insert is mirrored to Supabase bot_logs_tail via the async
+# shipper so the renderer can subscribe to realtime INSERT events instead of
+# polling 127.0.0.1:8000/api/bots/{id}/logs. NEVER raises — a Supabase outage
+# must not break the local bot run.
+def _ship(bl) -> None:
+    try:
+        lvl = getattr(bl.level, "value", str(bl.level))
+        _cloud_ship_log(str(bl.bot_id), str(bl.user_id), str(lvl), bl.message or "", bl.id)
+    except Exception:
+        pass
 from ..auth import get_default_user as get_current_user
 
 _SDK_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'sdk')
@@ -185,9 +198,9 @@ def _run_once(bot_uuid: str, tmp_path: str, user_id: int, db,
     except Exception as exc:
         err = f"[WATCHDOG] Failed to launch bot process: {exc}"
         try:
-            db.add(models.BotLog(bot_id=bot_uuid, user_id=user_id,
-                                 level=models.LogLevel.ERROR, message=err))
-            db.commit()
+            bl = models.BotLog(bot_id=bot_uuid, user_id=user_id,
+                               level=models.LogLevel.ERROR, message=err)
+            db.add(bl); db.commit(); _ship(bl)
         except Exception:
             pass
         return -1
@@ -208,9 +221,9 @@ def _run_once(bot_uuid: str, tmp_path: str, user_id: int, db,
             else:
                 level = models.LogLevel.INFO
             try:
-                db.add(models.BotLog(bot_id=bot_uuid, user_id=user_id,
-                                     level=level, message=line))
-                db.commit()
+                bl = models.BotLog(bot_id=bot_uuid, user_id=user_id,
+                                   level=level, message=line)
+                db.add(bl); db.commit(); _ship(bl)
             except Exception as _bl_e:
                 # Log it so we can see it (was silent before — hid major bugs)
                 try: db.rollback()
@@ -221,9 +234,9 @@ def _run_once(bot_uuid: str, tmp_path: str, user_id: int, db,
     except Exception as stream_exc:
         err = f"[WATCHDOG] Log stream error for bot {bot_uuid}: {stream_exc}"
         try:
-            db.add(models.BotLog(bot_id=bot_uuid, user_id=user_id,
-                                 level=models.LogLevel.ERROR, message=err))
-            db.commit()
+            bl = models.BotLog(bot_id=bot_uuid, user_id=user_id,
+                               level=models.LogLevel.ERROR, message=err)
+            db.add(bl); db.commit(); _ship(bl)
         except Exception:
             pass
     finally:
@@ -265,9 +278,9 @@ def _execute(bot_uuid: str, code: str, user_id: int, env: dict,
 
             def _setup_log(line: str) -> None:
                 try:
-                    db.add(models.BotLog(bot_id=bot_uuid, user_id=user_id,
-                                         level=models.LogLevel.INFO, message=line))
-                    db.commit()
+                    bl = models.BotLog(bot_id=bot_uuid, user_id=user_id,
+                                       level=models.LogLevel.INFO, message=line)
+                    db.add(bl); db.commit(); _ship(bl)
                 except Exception:
                     try: db.rollback()
                     except Exception: pass
@@ -300,9 +313,9 @@ def _execute(bot_uuid: str, code: str, user_id: int, env: dict,
         exit_msg = f"[WATCHDOG] Process exited with code {rc}"
         exit_level = models.LogLevel.INFO if rc == 0 else models.LogLevel.ERROR
         try:
-            db.add(models.BotLog(bot_id=bot_uuid, user_id=user_id,
-                                 level=exit_level, message=exit_msg))
-            db.commit()
+            bl = models.BotLog(bot_id=bot_uuid, user_id=user_id,
+                               level=exit_level, message=exit_msg)
+            db.add(bl); db.commit(); _ship(bl)
         except Exception:
             pass
 
@@ -328,9 +341,9 @@ def _execute(bot_uuid: str, code: str, user_id: int, env: dict,
         err_msg = f"[WATCHDOG] Runner error: {exc}\n{_tb.format_exc()}"
         try:
             db.rollback()
-            db.add(models.BotLog(bot_id=bot_uuid, user_id=user_id,
-                                 level=models.LogLevel.ERROR, message=err_msg[:2000]))
-            db.commit()
+            bl = models.BotLog(bot_id=bot_uuid, user_id=user_id,
+                               level=models.LogLevel.ERROR, message=err_msg[:2000])
+            db.add(bl); db.commit(); _ship(bl)
         except Exception as _le:
             logging.getLogger("watchdog.bot.exec").warning("err-log insert failed: %s", _le)
         try:
