@@ -101,6 +101,14 @@ async def lifespan(app: FastAPI):
         print("[watchdog] Session manager stopped")
     except Exception:
         pass
+    # v1.1.2: flush queued log lines to Supabase before exit so the last
+    # ~250 ms of bot output isn't silently lost on every backend restart.
+    try:
+        from .cloud_log_shipper import shutdown as _shutdown_cloud_logs
+        _shutdown_cloud_logs(wait=True, timeout=3.0)
+        print("[watchdog] cloud_log_shipper flushed and stopped")
+    except Exception as _e:
+        print(f"[watchdog] cloud_log_shipper shutdown failed: {_e}")
     print("[watchdog] Shutting down")
 
 
