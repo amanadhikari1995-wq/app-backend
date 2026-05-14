@@ -7,13 +7,37 @@ data-fetch surface for bot/api_connection in the backend.
 """
 from __future__ import annotations
 
-import json, logging, os
+import base64, json, logging, os
 from pathlib import Path
 from typing import Optional
 
 import httpx
 
 log = logging.getLogger("watchdog.cloud_db")
+
+
+def _user_id_from_jwt(jwt: str) -> str:
+    """v1.1.4 fallback. Decode the JWT's `sub` claim WITHOUT signature
+    verification — we already trust the token (we're about to send it back
+    to Supabase as our own auth), so the signature isn't relevant for this
+    decode. Used when session.json doesn't have `user_id` at the top level
+    or nested under `user.id` (an older Electron build's setSession handler
+    that wrote the token but not the resolved user_id).
+    """
+    try:
+        parts = jwt.split('.')
+        if len(parts) < 2:
+            return ''
+        # base64url payload with optional padding
+        payload_b64 = parts[1]
+        padding = (4 - len(payload_b64) % 4) % 4
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64 + ('=' * padding)))
+        sub = payload.get('sub')
+        if isinstance(sub, str) and sub:
+            return sub
+        return ''
+    except Exception:
+        return ''
 
 SUPABASE_URL      = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
@@ -42,13 +66,30 @@ def _read_session() -> Optional[dict]:
         return None
 
 
+_last_jwt_fallback_warn_at = 0.0
+
+
 def _auth():
     """Returns (jwt, user_id) or None."""
+    global _last_jwt_fallback_warn_at
+    import time as _time
     sess = _read_session()
     if not sess:
         return None
     jwt = sess.get("access_token", "")
     uid = sess.get("user_id") or (sess.get("user") or {}).get("id") or ""
+    if not uid and jwt:
+        # v1.1.4: fall back to decoding the JWT's sub claim. session.json
+        # in some Electron builds is written without an explicit user_id
+        # field — without this fallback the cloud_log_shipper batched POSTs
+        # all dropped silently because _auth() returned None.
+        uid = _user_id_from_jwt(jwt)
+        if uid:
+            now = _time.monotonic()
+            # Log once per minute so backend.log shows this path being used.
+            if now - _last_jwt_fallback_warn_at > 60.0:
+                _last_jwt_fallback_warn_at = now
+                log.info("[cloud_db] _auth() — user_id absent from session.json; recovered from JWT sub claim (uid=%s)", uid)
     if not jwt or not uid:
         return None
     return jwt, uid
