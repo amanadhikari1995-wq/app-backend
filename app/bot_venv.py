@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -305,3 +306,123 @@ def remove_venv(bot_uuid: str) -> None:
             log.info("Removed venv for bot %s", bot_uuid)
         except Exception as e:
             log.warning("Failed to remove venv for %s: %s", bot_uuid, e)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Self-heal helpers (Phase 2.1)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# When a bot crashes with `ModuleNotFoundError: No module named 'X'`, the
+# runner can call install_one_into_venv(bot_uuid, 'X') and retry. This catches
+# the cases the AST scan misses:
+#   - importlib.import_module("ta") at runtime
+#   - imports inside try/except or conditional branches
+#   - transitive failures where the top-level import succeeds but a sub-import
+#     of an unlisted package fails
+
+# Pattern: `ModuleNotFoundError: No module named 'foo'`
+# (also handles the variant `ImportError: No module named 'foo'` from older Pythons)
+_MISSING_MODULE_RE = re.compile(
+    r"(?:ModuleNotFoundError|ImportError):\s*No module named\s*['\"]([A-Za-z0-9_.]+)['\"]",
+    re.IGNORECASE,
+)
+
+
+def parse_missing_module(text: str) -> Optional[str]:
+    """Scan subprocess output for `ModuleNotFoundError: No module named 'X'`.
+
+    Returns the TOP-LEVEL module name (e.g. 'requests' from 'requests.adapters'),
+    or None if no such error is present. Returns the LAST match in the text so
+    that wrapper errors don't shadow the underlying cause.
+    """
+    if not text:
+        return None
+    matches = _MISSING_MODULE_RE.findall(text)
+    if not matches:
+        return None
+    raw = matches[-1].split(".")[0]
+    return raw or None
+
+
+# Defensive: refuse to auto-install module names that look like typos or
+# stdlib aliases. Keeps a careless `import req` from pulling an arbitrary
+# package from PyPI. Conservative — anything that doesn't look like a real
+# package name gets rejected.
+_AUTO_INSTALL_DENYLIST: set[str] = {
+    "req",          # almost always a typo for `requests`
+    "pip", "setuptools", "wheel",  # never installable as user code
+    "pandas_compat",  # historical name confusion
+}
+
+
+def _looks_installable(name: str) -> bool:
+    """Conservative sanity check before pip-installing arbitrary user input."""
+    if not name or len(name) < 2 or len(name) > 40:
+        return False
+    if name.startswith("_") or name in _AUTO_INSTALL_DENYLIST:
+        return False
+    # PyPI names are letters/digits/-/_/.; require it look that way.
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9_.-]*$", name):
+        return False
+    # Stdlib? Skip — venv install won't help.
+    if name in _stdlib_modules():
+        return False
+    return True
+
+
+def install_one_into_venv(
+    bot_uuid: str,
+    import_name: str,
+    log_callback=None,
+) -> Tuple[bool, Optional[str]]:
+    """Install a SINGLE missing dependency into an existing bot venv.
+
+    Returns (ok, error_message). On success, error_message is None.
+
+    Uses the same _IMPORT_TO_PYPI mapping as the AST scanner so that e.g.
+    `ModuleNotFoundError: 'cv2'` triggers `uv pip install opencv-python`.
+
+    No-ops (returns ok=False) if the module name looks unsafe to auto-install.
+    """
+    cb = log_callback or (lambda s: log.info("%s", s))
+
+    if not _looks_installable(import_name):
+        return (False, f"refusing to auto-install suspicious name: {import_name!r}")
+
+    py = venv_python(bot_uuid)
+    if not py.exists():
+        return (False, f"venv for bot {bot_uuid} does not exist; cannot install {import_name}")
+
+    uv = _find_uv()
+    if uv is None:
+        return (False, "uv.exe not bundled; cannot install missing dependency")
+
+    pypi = _IMPORT_TO_PYPI.get(import_name, import_name)
+    cb(f"auto-installing missing dependency: {pypi} (import name: {import_name})")
+
+    try:
+        proc = subprocess.Popen(
+            [str(uv), "pip", "install", pypi, "--python", str(py)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+            bufsize=1,
+        )
+        rc = _stream(proc, cb)
+        if rc != 0:
+            return (False, f"uv pip install {pypi} exited with code {rc}")
+    except Exception as e:
+        return (False, f"uv pip install {pypi} exception: {e}")
+
+    # Invalidate the hash marker so the next FULL prepare_venv() rebuilds with
+    # the union of declared + auto-installed packages (instead of resetting
+    # back to the user's declared list and dropping the auto-installs).
+    try:
+        marker = _hash_marker(bot_uuid)
+        if marker.exists():
+            marker.unlink()
+    except Exception:
+        pass
+
+    cb(f"installed {pypi}; will retry")
+    return (True, None)
