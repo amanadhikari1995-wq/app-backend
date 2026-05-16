@@ -157,7 +157,8 @@ def _build_env(bot_uuid: str, bot_row: dict, conns: list[dict], bot_secret: str)
 def _run_once(bot_uuid: str, tmp_path: str, user_id: int, db,
               env: dict, demo_mode: bool = False,
               python_exe: Optional[str] = None,
-              cwd: Optional[str] = None) -> int:
+              cwd: Optional[str] = None,
+              recent_lines_out: Optional[list] = None) -> int:
     """Run the bot script once, stream logs to SQLite, return exit code.
 
     If python_exe is provided (set when the bot has requirements + a venv),
@@ -165,6 +166,10 @@ def _run_once(bot_uuid: str, tmp_path: str, user_id: int, db,
     directly (no wd_runner wrapper) — wd_runner is only needed in the
     bundled-PyInstaller case to switch the frozen exe into "run a script"
     mode. A real venv python.exe just runs the script natively.
+
+    If recent_lines_out is a list, the last ~50 stdout lines are APPENDED to it
+    (mutated in place). Used by _execute() to scan for ModuleNotFoundError
+    after a non-zero exit and decide whether to auto-install and retry.
     """
     _popen_kwargs: dict = {}
     if sys.platform == "win32":
@@ -207,11 +212,17 @@ def _run_once(bot_uuid: str, tmp_path: str, user_id: int, db,
 
     _processes[bot_uuid] = process
 
+    # Rolling buffer of recent stdout lines for retry-on-missing-module scanning.
+    # Bounded to 50 entries so a runaway log doesn't blow memory.
+    from collections import deque as _deque
+    _recent: _deque = _deque(maxlen=50)
+
     try:
         for raw in process.stdout:
             line = _ANSI_RE.sub('', raw.rstrip())
             if not line:
                 continue
+            _recent.append(line)
             lower = line.lower()
             first = line.split(']')[0].lstrip('[').upper() if line.startswith('[') else ''
             if first in ('ERROR', 'EXCEPTION', 'FATAL') or any(w in lower for w in ('traceback', 'exception', 'error')):
@@ -245,6 +256,10 @@ def _run_once(bot_uuid: str, tmp_path: str, user_id: int, db,
         except Exception:
             process.kill()
 
+    # Expose the tail so the caller can scan for retryable failures.
+    if recent_lines_out is not None:
+        recent_lines_out.extend(_recent)
+
     return process.returncode
 
 
@@ -257,6 +272,30 @@ def _execute(bot_uuid: str, code: str, user_id: int, env: dict,
     tmp_path = None
     if conns_for_bot is None: conns_for_bot = []
     try:
+        # ── Pre-flight syntax check ─────────────────────────────────────────
+        # Gap 5: catch SyntaxError BEFORE spawning a subprocess so the user
+        # sees a single friendly line with the bad line number, not a
+        # mysterious "Process exited with code 1" after a venv install.
+        # Save-time validation could also live here in a future endpoint;
+        # for now we surface it at run-time which gives 100% coverage.
+        try:
+            compile(code, "<bot>", "exec")
+        except SyntaxError as _se:
+            line_no = getattr(_se, "lineno", None)
+            col_no  = getattr(_se, "offset", None)
+            msg     = getattr(_se, "msg", "syntax error")
+            where   = f" (line {line_no}" + (f", col {col_no}" if col_no else "") + ")" if line_no else ""
+            friendly = f"[WATCHDOG] Syntax error in your code{where}: {msg}"
+            try:
+                bl = models.BotLog(bot_id=bot_uuid, user_id=user_id,
+                                   level=models.LogLevel.ERROR, message=friendly)
+                db.add(bl); db.commit(); _ship(bl)
+            except Exception:
+                try: db.rollback()
+                except Exception: pass
+            cloud_db.update_bot_status(bot_uuid, status="ERROR", is_running=False)
+            return
+
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as f:
             f.write(code)
             tmp_path = f.name
@@ -306,9 +345,65 @@ def _execute(bot_uuid: str, code: str, user_id: int, env: dict,
         runtime_dir = _bot_runtime_dir(bot_uuid)
         _materialize_secrets_to_disk(runtime_dir, conns_for_bot, env)
 
-        rc = _run_once(bot_uuid, tmp_path, user_id, db, env,
-                       demo_mode=demo_mode, python_exe=python_exe,
-                       cwd=runtime_dir)
+        # ── Self-heal retry loop ────────────────────────────────────────────
+        # Gap 1: when the bot crashes with `ModuleNotFoundError: No module
+        # named 'X'` — which AST detection misses for dynamic imports, lazy
+        # imports inside try/except, or transitive failures — we parse the
+        # tail of subprocess output, install 'X' into the venv via uv, and
+        # retry. Capped at MAX_RETRIES so a genuinely-broken bot never loops.
+        # Only fires when we have a venv to install INTO (python_exe is set);
+        # without a venv, we have no place to put the new package.
+        MAX_RETRIES = 3
+        attempts = 0
+        rc = -1
+        while True:
+            tail_lines: list = []
+            rc = _run_once(bot_uuid, tmp_path, user_id, db, env,
+                           demo_mode=demo_mode, python_exe=python_exe,
+                           cwd=runtime_dir, recent_lines_out=tail_lines)
+
+            # User asked to stop -> _processes has been popped; respect that.
+            if bot_uuid not in _processes:
+                break
+            if rc == 0:
+                break
+            if attempts >= MAX_RETRIES:
+                break
+
+            from .. import bot_venv as _bv2
+            missing = _bv2.parse_missing_module("\n".join(tail_lines))
+            if not missing:
+                break  # exit code != 0 but not a missing-module failure
+
+            # If we don't have a venv yet (bundled-Python path), bootstrap one
+            # now containing just the missing module so the retry can run there.
+            def _setup_log_retry(line: str) -> None:
+                try:
+                    bl = models.BotLog(bot_id=bot_uuid, user_id=user_id,
+                                       level=models.LogLevel.INFO, message=line)
+                    db.add(bl); db.commit(); _ship(bl)
+                except Exception:
+                    try: db.rollback()
+                    except Exception: pass
+
+            if not python_exe:
+                py_path, perr = _bv2.prepare_venv(bot_uuid, missing,
+                                                  log_callback=_setup_log_retry)
+                if perr or not py_path:
+                    _setup_log_retry(f"[setup] cannot create venv for retry: {perr}")
+                    break
+                python_exe = str(py_path)
+            else:
+                ok, ierr = _bv2.install_one_into_venv(
+                    bot_uuid, missing, log_callback=_setup_log_retry
+                )
+                if not ok:
+                    _setup_log_retry(f"[setup] auto-install of {missing!r} failed: {ierr}")
+                    break
+
+            attempts += 1
+            _setup_log_retry(f"[setup] retrying bot (attempt {attempts}/{MAX_RETRIES}) after installing {missing!r}")
+            # Loop continues — re-runs the bot with the new dependency.
 
         exit_msg = f"[WATCHDOG] Process exited with code {rc}"
         exit_level = models.LogLevel.INFO if rc == 0 else models.LogLevel.ERROR
