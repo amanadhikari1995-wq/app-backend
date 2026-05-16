@@ -228,7 +228,15 @@ def _run_once(bot_uuid: str, tmp_path: str, user_id: int, db,
             _recent.append(line)
             lower = line.lower()
             first = line.split(']')[0].lstrip('[').upper() if line.startswith('[') else ''
-            if first in ('ERROR', 'EXCEPTION', 'FATAL') or any(w in lower for w in ('traceback', 'exception', 'error')):
+            # [DEBUG] lines come from wd_runner's structured-error wrapper —
+            # they carry the raw traceback that follows the friendly [ERROR]
+            # summary. They're kept for power users but should NOT be
+            # re-classified as ERROR by the substring match below (which
+            # would otherwise trip on words like "Traceback" / "Exception"
+            # appearing inside the [DEBUG] payload).
+            if first == 'DEBUG':
+                level = models.LogLevel.INFO
+            elif first in ('ERROR', 'EXCEPTION', 'FATAL') or any(w in lower for w in ('traceback', 'exception', 'error')):
                 level = models.LogLevel.ERROR
             elif first == 'WARNING' or 'warning' in lower or 'warn' in lower:
                 level = models.LogLevel.WARNING
