@@ -189,6 +189,55 @@ def _hash_marker(bot_uuid: str) -> Path:
     return _venvs_root() / bot_uuid / ".watchdog_req_hash"
 
 
+def _auto_installed_file(bot_uuid: str) -> Path:
+    """Per-bot file listing packages auto-installed by the self-heal retry
+    loop (ModuleNotFoundError → install_one_into_venv). The next run reads
+    this and unions it into the AST-detected requirements, so the venv is
+    rebuilt proactively in the setup phase instead of via a crash-retry
+    cycle every time the bot launches.
+    """
+    return _venvs_root() / bot_uuid / ".auto_installed.txt"
+
+
+def read_auto_installed(bot_uuid: str) -> list[str]:
+    """Read the persisted list of self-heal-installed packages for a bot.
+    Returns [] on missing file or read errors (never raises).
+    """
+    p = _auto_installed_file(bot_uuid)
+    if not p.exists():
+        return []
+    try:
+        lines = [ln.strip() for ln in p.read_text(encoding="utf-8").splitlines()]
+        return [ln for ln in lines if ln and not ln.startswith("#")]
+    except Exception as e:
+        log.warning("read_auto_installed(%s) failed: %s", bot_uuid, e)
+        return []
+
+
+def _record_auto_installed(bot_uuid: str, pypi_name: str) -> None:
+    """Append a successfully self-healed package to the persisted list.
+    De-duplicates case-insensitively by package name (first token before
+    any version specifier).
+    """
+    name_key = re.split(r"[=<>!~ ]", pypi_name, maxsplit=1)[0].strip().lower()
+    if not name_key:
+        return
+    existing = read_auto_installed(bot_uuid)
+    existing_keys = {
+        re.split(r"[=<>!~ ]", x, maxsplit=1)[0].strip().lower() for x in existing
+    }
+    if name_key in existing_keys:
+        return
+    p = _auto_installed_file(bot_uuid)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as fh:
+            fh.write(pypi_name + "\n")
+    except Exception as e:
+        log.warning("_record_auto_installed(%s, %s) failed: %s",
+                    bot_uuid, pypi_name, e)
+
+
 def is_venv_valid(bot_uuid: str, requirements_hash: str) -> bool:
     """True if the venv exists AND its stored hash matches. Otherwise the
     caller must (re)install."""
@@ -413,6 +462,11 @@ def install_one_into_venv(
             return (False, f"uv pip install {pypi} exited with code {rc}")
     except Exception as e:
         return (False, f"uv pip install {pypi} exception: {e}")
+
+    # Persist the auto-install so subsequent runs proactively rebuild the
+    # venv with this dep in the requirements list, avoiding the crash-retry
+    # cycle for repeated launches of the same bot.
+    _record_auto_installed(bot_uuid, pypi)
 
     # Invalidate the hash marker so the next FULL prepare_venv() rebuilds with
     # the union of declared + auto-installed packages (instead of resetting
