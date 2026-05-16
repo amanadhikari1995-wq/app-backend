@@ -178,15 +178,18 @@ def _run_once(bot_uuid: str, tmp_path: str, user_id: int, db,
     env["DRY_RUN"] = "1" if demo_mode else "0"
 
     try:
+        # ── v2 wd_runner now also wraps user code in a friendly-error
+        # layer (Gap 3 of the bot-DX overhaul). Route BOTH the venv and
+        # bundled-Python paths through it so the user sees consistent
+        # "[ERROR] line 42: <type> — <hint>" output regardless of whether
+        # their bot needs a venv. wd_runner is pure-stdlib for the wrapper
+        # logic; its `import wd_autolog` is in a try/except, so the venv
+        # path (where wd_autolog isn't available) just emits a single
+        # info line about hooks being unavailable and moves on.
+        _wd_runner = os.path.join(_SDK_DIR, 'wd_runner.py')
         if python_exe:
-            # Real venv python: run the bot script directly. Auto-log hooks
-            # would require wd_autolog to be installed in the venv too — defer
-            # for now; bots use plain print() which is fine.
-            cmd = [python_exe, '-u', tmp_path]
+            cmd = [python_exe, '-u', _wd_runner, tmp_path]
         else:
-            # Bundled PyInstaller path: re-invoke this exe via wd_runner.py
-            # (run_backend.py detects script arg and switches to runpy mode).
-            _wd_runner = os.path.join(_SDK_DIR, 'wd_runner.py')
             cmd = [sys.executable, '-u', _wd_runner, tmp_path]
         process = subprocess.Popen(
             cmd,
