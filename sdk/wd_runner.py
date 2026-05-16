@@ -7,11 +7,17 @@ directly:
     BEFORE: python -u code.py
     AFTER:  python -u wd_runner.py code.py
 
-Three responsibilities:
+Four responsibilities:
   1. Best-effort install of auto-logging hooks (wd_autolog) — never blocks
      the bot if hook setup fails or the module isn't available (venv path).
   2. Run the user's code as __main__ via runpy.
-  3. Wrap that run in a structured error layer:
+  3. Entry-point auto-discovery — if the user's script only DEFINES
+     functions/classes (no top-level executable code, no __main__ guard),
+     look for main() / run() / start() and call the first one found.
+     Handles async entry points too via asyncio.run(). This makes the
+     bot forgiving of users who wrote a strategy function but forgot to
+     call it.
+  4. Wrap everything in a structured error layer:
        - On exception, walk the traceback to find the FIRST frame whose
          filename matches the user's script.
        - Emit ONE friendly [ERROR] line with the line number AND a hint
@@ -27,6 +33,9 @@ Three responsibilities:
 Pure stdlib — works inside any bot venv regardless of which packages the
 user has declared.
 """
+import ast
+import asyncio
+import inspect
 import os
 import re
 import runpy
@@ -196,6 +205,98 @@ def _emit_friendly(exc: BaseException, user_script_path: str) -> None:
         pass
 
 
+def _has_active_top_level_code(source: str) -> bool:
+    """Detect whether the user's script has any top-level executable code.
+
+    Returns True if the body contains anything beyond purely-passive nodes
+    (imports, function defs, class defs, simple assignments, docstrings,
+    or an `if __name__ == "__main__":` guard). Returns False when the
+    script ONLY defines callables and never invokes them — that's the
+    case where entry-point auto-discovery should kick in.
+
+    A SyntaxError pre-empts auto-discovery (we let runpy raise normally
+    so the friendly-error path takes over).
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return True  # let runpy surface the syntax error
+
+    PASSIVE_DEFS = (ast.Import, ast.ImportFrom,
+                    ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    PASSIVE_ASSIGNS = (ast.Assign, ast.AnnAssign, ast.AugAssign)
+
+    for node in tree.body:
+        if isinstance(node, PASSIVE_DEFS):
+            continue
+        if isinstance(node, PASSIVE_ASSIGNS):
+            continue
+        # Module docstring or other bare-constant expression
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+            continue
+        # `if __name__ == "__main__":` — user is explicit, treat as active
+        if isinstance(node, ast.If):
+            test = node.test
+            if (isinstance(test, ast.Compare)
+                    and isinstance(test.left, ast.Name) and test.left.id == "__name__"
+                    and len(test.comparators) == 1
+                    and isinstance(test.comparators[0], ast.Constant)
+                    and test.comparators[0].value == "__main__"):
+                return True
+            return True  # any other top-level if = active
+        # Anything else (Try/While/For/Match/calls/etc) is active
+        return True
+    return False
+
+
+def _maybe_call_entry(run_globals: dict, source: str) -> None:
+    """If the user's script only defines callables (no top-level code),
+    look for main() / run() / start() and invoke the first one found.
+    Handles async entry points via asyncio.run().
+
+    Called AFTER runpy.run_path. The runpy call already executed any
+    top-level code; this step only fires when there was none.
+    """
+    if _has_active_top_level_code(source):
+        return  # user managed their own entry — don't second-guess
+    for name in ("main", "run", "start"):
+        fn = run_globals.get(name)
+        if not callable(fn):
+            continue
+        is_async = inspect.iscoroutinefunction(fn)
+        try:
+            sig = inspect.signature(fn)
+            required = [p for p in sig.parameters.values()
+                        if p.default is inspect.Parameter.empty
+                        and p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                                       inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+        except (TypeError, ValueError):
+            required = []
+        if required:
+            # We can't supply arguments. Tell the user explicitly so they
+            # know what to fix; don't try to call it.
+            arg_list = ", ".join(p.name for p in required)
+            print(f"[wd_runner] found {name}({arg_list}) but it requires "
+                  f"arguments — please call it yourself from your script.",
+                  flush=True)
+            return
+        kind = "async " if is_async else ""
+        print(f"[wd_runner] no top-level code detected — auto-calling {kind}{name}()",
+              flush=True)
+        if is_async:
+            asyncio.run(fn())
+        else:
+            fn()
+        return
+    # No entry point found AND no top-level code → user defined functions
+    # but nothing runs. Warn loudly so they don't sit watching an idle bot.
+    if any(callable(v) for k, v in run_globals.items() if not k.startswith("_")):
+        print("[wd_runner] WARNING: your script only defines functions/classes "
+              "and has no top-level code, main(), run(), or start(). "
+              "Nothing will execute. Did you forget to call your strategy?",
+              flush=True)
+
+
 def main():
     if len(sys.argv) < 2:
         print("[wd_runner] usage: wd_runner.py <bot_code.py>", flush=True)
@@ -215,10 +316,17 @@ def main():
     # ── 2. Make sys.argv look as if the bot was launched directly ────────
     sys.argv = [code_path] + sys.argv[2:]
 
-    # ── 3. Run the user's code inside a friendly-error wrapper ───────────
-    import runpy
+    # ── 3. Read source once for entry-point heuristics + traceback fallback
     try:
-        runpy.run_path(code_path, run_name="__main__")
+        with open(code_path, "r", encoding="utf-8") as _f:
+            _source = _f.read()
+    except Exception:
+        _source = ""
+
+    # ── 4. Run the user's code inside a friendly-error wrapper ───────────
+    try:
+        run_globals = runpy.run_path(code_path, run_name="__main__")
+        _maybe_call_entry(run_globals, _source)
     except KeyboardInterrupt:
         # User clicked Stop. CTRL_BREAK on Windows raises KeyboardInterrupt
         # inside the script. Keep silent so the outer log just shows the
