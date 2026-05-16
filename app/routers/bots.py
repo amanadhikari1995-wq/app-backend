@@ -342,6 +342,26 @@ def _execute(bot_uuid: str, code: str, user_id: int, env: dict,
                     effective_reqs = "\n".join(detected)
                     _setup_log(f"[setup] auto-detected dependencies: {', '.join(detected)}")
 
+            # Gap 1 follow-up: read persisted self-heal-installed packages
+            # from previous runs so we activate the venv proactively this
+            # time (instead of crashing on import → retry-and-install).
+            try:
+                persisted = _bv.read_auto_installed(bot_uuid)
+            except Exception:
+                persisted = []
+            if persisted:
+                # De-dup with whatever we already have in effective_reqs.
+                # Compare by lowercased package name (first token before
+                # any version specifier) so we don't append duplicates.
+                import re as _re_dep
+                def _key(line: str) -> str:
+                    return _re_dep.split(r"[=<>!~ ]", line.strip(), maxsplit=1)[0].strip().lower()
+                existing_keys = {_key(ln) for ln in effective_reqs.splitlines() if ln.strip()}
+                added = [p for p in persisted if _key(p) and _key(p) not in existing_keys]
+                if added:
+                    effective_reqs = (effective_reqs + "\n" + "\n".join(added)).strip()
+                    _setup_log(f"[setup] including previously auto-installed deps: {', '.join(added)}")
+
             if effective_reqs:
                 py_path, err = _bv.prepare_venv(bot_uuid, effective_reqs, log_callback=_setup_log)
                 if err:
